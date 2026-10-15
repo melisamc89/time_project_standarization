@@ -2,39 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Mutual Information analysis pipeline for standardized datasets.
+Mutual Information Analysis Pipeline with Dynamic Path & Schema Correction.
 
-What this script does
----------------------
-1) Reads the master standardized dataset index CSV.
-2) Loads each standardized session pickle.
-3) Computes per-neuron mutual information with:
-       - position
-       - position_x_direction
-       - speed
-       - time
-       - inner_time
-       - direction
-       - trial_id
-4) Saves:
-       - one CSV with one row per neuron across all datasets/sessions
-       - one CSV with one row per session summarizing mean/std MI
-       - one pickle per session with full MI arrays
-       - one log txt file
-
-Assumptions
------------
-- signal is shaped: (n_timepoints, n_neurons)
-- pos may be:
-      * 1D: (n_timepoints,)
-      * 2D: (n_timepoints, d)
-  In this script, "position" is defined as the first coordinate: pos[:, 0]
-- "position_x_direction" = position_1d * mov_dir
-- mutual_info_regression is used as in the previous code base
+Fixes:
+1. Translates old root paths (/home/melisamc/...) to active paths (/home/hippolab/Documents/melisa/...).
+2. Recovers malformed/shifted paths (e.g. '1000' in shifted CSV rows).
+3. Handles '_pkl' vs '.pkl' filename differences.
+4. Computes per-neuron MI against behaviors and full LFP features (envelopes and circular phases).
 """
 
 import os
 import csv
+import glob
 import pickle
 import timeit
 from datetime import datetime
@@ -43,26 +22,24 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_selection import mutual_info_regression
 
-
 # =============================================================================
-# Paths
+# Paths & Settings
 # =============================================================================
 
-CSV_PATH = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
+PROJECT_ROOT = "/home/hippolab/Documents/melisa/time_project_standarization"
+OLD_PROJECT_ROOT = "/home/melisamc/Documents/time_project_standarization"
 
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/mutual_information"
+CSV_PATH = os.path.join(PROJECT_ROOT, "data", "metadata", "master_dataset_index.csv")
+STANDARDIZED_DIR = os.path.join(PROJECT_ROOT, "data", "standardized_sessions")
+
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "analysis", "mutual_information_behavior_and_lfp")
 SESSION_PKL_DIR = os.path.join(OUTPUT_DIR, "session_pickles")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 
 NEURON_MI_CSV = os.path.join(OUTPUT_DIR, "mutual_information_per_neuron.csv")
 SESSION_MI_CSV = os.path.join(OUTPUT_DIR, "mutual_information_per_session_summary.csv")
 
-
-# =============================================================================
-# Parameters
-# =============================================================================
-
-MAX_ROWS = None                # set to integer for testing
+MAX_ROWS = None
 MI_N_NEIGHBORS = 50
 MI_RANDOM_STATE = 16
 VERBOSE = True
@@ -77,9 +54,31 @@ BEHAVIOR_LABELS = [
     "trial_id",
 ]
 
+LFP_BAND_NAMES = [
+    "ultra_ultra_slow",
+    "ultra_slow",
+    "slow",
+    "delta",
+    "theta",
+    "gamma",
+    "ripple",
+    "mua",
+]
+
+LFP_WAVEFORM_LABELS = [f"lfp_{band}" for band in LFP_BAND_NAMES]
+LFP_ENVELOPE_LABELS = [f"lfp_{band}_envelope" for band in LFP_BAND_NAMES]
+LFP_PHASE_LABELS = [f"lfp_{band}_phase" for band in LFP_BAND_NAMES]
+
+ALL_FEATURE_LABELS = (
+        BEHAVIOR_LABELS
+        + LFP_WAVEFORM_LABELS
+        + LFP_ENVELOPE_LABELS
+        + LFP_PHASE_LABELS
+)
+
 
 # =============================================================================
-# Helpers
+# Helper Utilities
 # =============================================================================
 
 def ensure_dir(path):
@@ -121,13 +120,7 @@ def get_pos_1d(pos):
 
 def sanitize_for_filename(text):
     text = str(text)
-    safe = []
-    for ch in text:
-        if ch.isalnum() or ch in ["-", "_"]:
-            safe.append(ch)
-        else:
-            safe.append("_")
-    return "".join(safe)
+    return "".join([ch if (ch.isalnum() or ch in ["-", "_"]) else "_" for ch in text])
 
 
 def base_name_from_row(row_idx, row):
@@ -140,75 +133,94 @@ def base_name_from_row(row_idx, row):
     )
 
 
-def infer_recording_type(row):
+# =============================================================================
+# Dynamic Path Resolver
+# =============================================================================
+
+def resolve_actual_file_path(row):
     """
-    Returns 'calcium', 'ephys', or 'unknown'.
-
-    Priority:
-    1) explicit columns if present
-    2) infer from dataset_name / file path
+    Resolves the actual standardized .pkl path on disk, correcting:
+    1. Base directory shifts (/home/melisamc/... -> /home/hippolab/Documents/melisa/...)
+    2. Column-shifted entries (e.g. '1000' in place of path)
+    3. Extensions named '_pkl' instead of '.pkl'
     """
-    candidate_columns = [
-        "recording_type",
-        "modality",
-        "signal_type",
-        "dataset_type",
-        "data_type",
-    ]
-    for col in candidate_columns:
-        if col in row and pd.notna(row[col]):
-            value = str(row[col]).strip().lower()
-            if "calcium" in value:
-                return "calcium"
-            if "ephys" in value or "electro" in value:
-                return "ephys"
+    raw_path = str(row.get("standardized_file_path", "")).strip()
+    dataset_name = str(row.get("dataset_name", "")).strip()
+    mouse_name = str(row.get("mouse_name", "")).strip()
+    depth_type = str(row.get("depth_type", "")).strip()
 
-    text_to_search = " ".join([
-        str(row.get("dataset_name", "")),
-        str(row.get("standardized_file_path", "")),
-    ]).lower()
+    candidate_paths = []
 
-    if any(k in text_to_search for k in ["calcium", "caim", "dff", "trace"]):
-        return "calcium"
-    if any(k in text_to_search for k in ["ephys", "lfp", "spike", "electro"]):
-        return "ephys"
+    # 1. Direct translation of old root to new root
+    if raw_path and not raw_path.replace(".", "", 1).isdigit():
+        if raw_path.startswith(OLD_PROJECT_ROOT):
+            migrated = raw_path.replace(OLD_PROJECT_ROOT, PROJECT_ROOT)
+            candidate_paths.append(migrated)
+            if migrated.endswith("_pkl"):
+                candidate_paths.append(migrated[:-4] + ".pkl")
+        candidate_paths.append(raw_path)
+        if raw_path.endswith("_pkl"):
+            candidate_paths.append(raw_path[:-4] + ".pkl")
 
-    return "unknown"
+    # 2. Check candidate paths
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            return p
+
+    # 3. Reconstruct path from metadata if column was shifted (e.g. '1000')
+    if dataset_name and mouse_name:
+        dataset_dir = os.path.join(STANDARDIZED_DIR, dataset_name)
+        if os.path.isdir(dataset_dir):
+            patterns = [
+                os.path.join(dataset_dir, "**", f"*{mouse_name}*.pkl"),
+                os.path.join(dataset_dir, "**", f"*{mouse_name}*_pkl"),
+            ]
+            for pat in patterns:
+                matches = glob.glob(pat, recursive=True)
+                if matches:
+                    if depth_type:
+                        for m in matches:
+                            if depth_type in m:
+                                return m
+                    return matches[0]
+
+    # 4. Search across all of STANDARDIZED_DIR by mouse_name
+    if mouse_name:
+        matches = glob.glob(os.path.join(STANDARDIZED_DIR, "**", f"*{mouse_name}*.pkl"), recursive=True)
+        if matches:
+            if depth_type:
+                for m in matches:
+                    if depth_type in m:
+                        return m
+            return matches[0]
+
+    return None
 
 
-def validate_lengths(signal, behavior_dict, row_idx):
-    n_time = signal.shape[0]
-    for key, value in behavior_dict.items():
-        if value is None:
-            continue
-        if len(value) != n_time:
-            raise ValueError(
-                f"Row {row_idx}: length mismatch for '{key}' "
-                f"({len(value)} vs {n_time})"
-            )
+# =============================================================================
+# Mutual Information Computation
+# =============================================================================
 
-
-def compute_single_feature_mi(feature_1d, signal_2d, n_neighbors=50, random_state=16):
-    """
-    Compute MI(feature -> neuron signal) for all neurons independently.
-
-    feature_1d : shape (n_time,)
-    signal_2d  : shape (n_time, n_neurons)
-
-    Returns
-    -------
-    mi_values : shape (n_neurons,)
-    """
-    x = ensure_1d(feature_1d).reshape(-1, 1)
+def compute_mi_feature_to_signal(feature_arr, signal_2d, n_neighbors=50, random_state=16):
+    x = ensure_2d(feature_arr)
     signal_2d = ensure_2d(signal_2d)
-
     n_neurons = signal_2d.shape[1]
     mi_values = np.full(n_neurons, np.nan, dtype=float)
 
+    valid_mask = ~np.any(np.isnan(x), axis=1)
+    if np.sum(valid_mask) < 20 or np.any(np.std(x[valid_mask, :], axis=0) == 0):
+        return mi_values
+
+    x_clean = x[valid_mask, :]
+
     for neuron_idx in range(n_neurons):
-        y = signal_2d[:, neuron_idx]
+        y = signal_2d[valid_mask, neuron_idx]
+        if np.std(y) == 0:
+            mi_values[neuron_idx] = 0.0
+            continue
+
         mi = mutual_info_regression(
-            x,
+            x_clean,
             y,
             n_neighbors=n_neighbors,
             random_state=random_state,
@@ -218,83 +230,22 @@ def compute_single_feature_mi(feature_1d, signal_2d, n_neighbors=50, random_stat
     return mi_values
 
 
-def build_behavior_features(data):
-    """
-    Create the behavioral variables used for MI.
-    """
-    signal = ensure_2d(data["signal"])
-    pos_1d = ensure_1d(get_pos_1d(data["pos"]))
-    mov_dir = ensure_1d(data["mov_dir"])
-    time_1d = ensure_1d(data["time"])
-
-    speed = ensure_1d(data["speed"]) if data.get("speed", None) is not None else None
-    inner_time = ensure_1d(data["inner_time"]) if data.get("inner_time", None) is not None else None
-    trial_id = ensure_1d(data["trial_id"]) if data.get("trial_id", None) is not None else None
-
-    position_x_direction = pos_1d * mov_dir
-
-    behavior_dict = {
-        "position": pos_1d,
-        "position_x_direction": position_x_direction,
-        "speed": speed,
-        "time": time_1d,
-        "inner_time": inner_time,
-        "direction": mov_dir,
-        "trial_id": trial_id,
-    }
-
-    validate_lengths(signal, behavior_dict, row_idx="unknown")
-
-    return signal, behavior_dict
-
-
-def compute_mi_for_session(data):
-    """
-    Returns
-    -------
-    mi_dict : dict
-        keys are behavior names, values are arrays of shape (n_neurons,)
-    """
-    signal, behavior_dict = build_behavior_features(data)
-
-    mi_dict = {}
-    for label in BEHAVIOR_LABELS:
-        feature = behavior_dict[label]
-        if feature is None:
-            mi_dict[label] = None
-        else:
-            mi_dict[label] = compute_single_feature_mi(
-                feature_1d=feature,
-                signal_2d=signal,
-                n_neighbors=MI_N_NEIGHBORS,
-                random_state=MI_RANDOM_STATE,
-            )
-    return mi_dict, signal.shape[0], signal.shape[1]
-
-
 # =============================================================================
-# CSV schemas
+# CSV Schemas
 # =============================================================================
 
 NEURON_MI_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "recording_type",
-    "standardized_file_path",
-    "row_index",
-    "neuron_index",
-    "n_timepoints",
-    "n_neurons_in_session",
-    "mi_position",
-    "mi_position_x_direction",
-    "mi_speed",
-    "mi_time",
-    "mi_inner_time",
-    "mi_direction",
-    "mi_trial_id",
-]
+                        "dataset_name",
+                        "mouse_name",
+                        "session_name",
+                        "depth_type",
+                        "recording_type",
+                        "standardized_file_path",
+                        "row_index",
+                        "neuron_index",
+                        "n_timepoints",
+                        "n_neurons_in_session",
+                    ] + [f"mi_{feat}" for feat in ALL_FEATURE_LABELS]
 
 SESSION_MI_COLUMNS = [
     "dataset_name",
@@ -306,23 +257,11 @@ SESSION_MI_COLUMNS = [
     "row_index",
     "n_timepoints",
     "n_neurons",
-    "mi_position_mean",
-    "mi_position_std",
-    "mi_position_x_direction_mean",
-    "mi_position_x_direction_std",
-    "mi_speed_mean",
-    "mi_speed_std",
-    "mi_time_mean",
-    "mi_time_std",
-    "mi_inner_time_mean",
-    "mi_inner_time_std",
-    "mi_direction_mean",
-    "mi_direction_std",
-    "mi_trial_id_mean",
-    "mi_trial_id_std",
-    "session_pickle_name",
-    "session_pickle_path",
 ]
+for feat in ALL_FEATURE_LABELS:
+    SESSION_MI_COLUMNS.extend([f"mi_{feat}_mean", f"mi_{feat}_std"])
+
+SESSION_MI_COLUMNS.extend(["session_pickle_name", "session_pickle_path"])
 
 
 def init_csv(csv_path, columns):
@@ -336,10 +275,6 @@ def append_csv_row(csv_path, columns, row):
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writerow(row)
 
-
-# =============================================================================
-# Logging
-# =============================================================================
 
 class Tee:
     def __init__(self, *files):
@@ -356,32 +291,40 @@ class Tee:
 
 
 # =============================================================================
-# Main processing
+# Session Processing Routine
 # =============================================================================
 
 def process_row(row_idx, row):
-    standardized_file_path = row["standardized_file_path"]
+    actual_file_path = resolve_actual_file_path(row)
 
-    if not os.path.isfile(standardized_file_path):
-        raise FileNotFoundError(f"Missing standardized file: {standardized_file_path}")
+    if actual_file_path is None or not os.path.isfile(actual_file_path):
+        raise FileNotFoundError(
+            f"Could not resolve file for row {row_idx}: "
+            f"dataset={row.get('dataset_name')}, mouse={row.get('mouse_name')}, "
+            f"raw_path={row.get('standardized_file_path')}"
+        )
 
-    data = load_pickle_standard(standardized_file_path)
+    data = load_pickle_standard(actual_file_path)
 
     required_keys = ["signal", "pos", "mov_dir", "time"]
     for key in required_keys:
         if key not in data:
-            raise KeyError(f"Missing key '{key}' in file: {standardized_file_path}")
+            raise KeyError(f"Missing required key '{key}' in: {actual_file_path}")
 
     signal = ensure_2d(data["signal"])
+    n_timepoints, n_neurons = signal.shape
+    if n_neurons < 1:
+        raise ValueError(f"Row {row_idx}: Session has no neurons.")
+
+    # 1. Behavioral Features
     pos_1d = ensure_1d(get_pos_1d(data["pos"]))
     mov_dir = ensure_1d(data["mov_dir"])
     time_1d = ensure_1d(data["time"])
+    speed = ensure_1d(data["speed"]) if data.get("speed") is not None else None
+    inner_time = ensure_1d(data["inner_time"]) if data.get("inner_time") is not None else None
+    trial_id = ensure_1d(data["trial_id"]) if data.get("trial_id") is not None else None
 
-    speed = ensure_1d(data["speed"]) if data.get("speed", None) is not None else None
-    inner_time = ensure_1d(data["inner_time"]) if data.get("inner_time", None) is not None else None
-    trial_id = ensure_1d(data["trial_id"]) if data.get("trial_id", None) is not None else None
-
-    behavior_dict = {
+    features_dict = {
         "position": pos_1d,
         "position_x_direction": pos_1d * mov_dir,
         "speed": speed,
@@ -390,119 +333,127 @@ def process_row(row_idx, row):
         "direction": mov_dir,
         "trial_id": trial_id,
     }
-    validate_lengths(signal, behavior_dict, row_idx=row_idx)
 
-    n_timepoints = signal.shape[0]
-    n_neurons = signal.shape[1]
+    # 2. LFP Waveforms, Envelopes, and Circular Phases
+    for band in LFP_BAND_NAMES:
+        wav_key = f"lfp_{band}"
+        env_key = f"lfp_{band}_envelope"
+        phase_key = f"lfp_{band}_phase"
 
-    if n_neurons < 1:
-        raise ValueError(f"Row {row_idx}: signal has no neurons")
+        features_dict[wav_key] = ensure_1d(data[wav_key]) if wav_key in data and data[wav_key] is not None else None
+        features_dict[env_key] = ensure_1d(data[env_key]) if env_key in data and data[env_key] is not None else None
+
+        if phase_key in data and data[phase_key] is not None:
+            phi = ensure_1d(data[phase_key])
+            features_dict[phase_key] = np.column_stack([np.cos(phi), np.sin(phi)])
+        else:
+            features_dict[phase_key] = None
+
+    # Length alignment validation
+    for feat_name, arr in features_dict.items():
+        if arr is not None and len(arr) != n_timepoints:
+            raise ValueError(f"Row {row_idx}: Length mismatch for '{feat_name}' ({len(arr)} vs {n_timepoints}).")
 
     if VERBOSE:
         print(
-            f"Row {row_idx} | dataset={row['dataset_name']} | mouse={row['mouse_name']} | "
-            f"session={row['session_name']} | depth={row['depth_type']} | "
+            f"Row {row_idx:03d} | dataset={row.get('dataset_name', '')} | mouse={row.get('mouse_name', '')} | "
+            f"session={row.get('session_name', '')} | depth={row.get('depth_type', '')} | "
             f"timepoints={n_timepoints} | neurons={n_neurons}"
         )
 
-    mi_dict, _, _ = compute_mi_for_session(data)
+    # 3. Compute MI across all features
+    mi_dict = {}
+    for label in ALL_FEATURE_LABELS:
+        feat = features_dict.get(label)
+        if feat is None:
+            mi_dict[label] = None
+        else:
+            mi_dict[label] = compute_mi_feature_to_signal(
+                feature_arr=feat,
+                signal_2d=signal,
+                n_neighbors=MI_N_NEIGHBORS,
+                random_state=MI_RANDOM_STATE,
+            )
 
-    recording_type = infer_recording_type(row)
+    recording_type = "calcium" if "calcium" in str(row.get("modality", "")).lower() else "ephys"
 
-    # Save session pickle
-    session_base = base_name_from_row(row_idx, row) + "_mi"
+    # 4. Save Session Pickle
+    session_base = base_name_from_row(row_idx, row) + "_behavior_and_lfp_mi"
     session_pickle_name = session_base + ".pkl"
     session_pickle_path = os.path.join(SESSION_PKL_DIR, session_pickle_name)
 
     session_payload = {
         "metadata": {
-            "dataset_name": row["dataset_name"],
-            "mouse_name": row["mouse_name"],
-            "session_name": row["session_name"],
-            "depth_type": row["depth_type"],
+            "dataset_name": row.get("dataset_name", ""),
+            "mouse_name": row.get("mouse_name", ""),
+            "session_name": row.get("session_name", ""),
+            "depth_type": row.get("depth_type", ""),
             "recording_type": recording_type,
             "row_index": row_idx,
-            "standardized_file_path": standardized_file_path,
+            "standardized_file_path": actual_file_path,
             "n_timepoints": n_timepoints,
             "n_neurons": n_neurons,
             "mi_method": "mutual_info_regression",
             "mi_n_neighbors": MI_N_NEIGHBORS,
             "mi_random_state": MI_RANDOM_STATE,
-            "behavior_labels": BEHAVIOR_LABELS,
+            "feature_labels": ALL_FEATURE_LABELS,
         },
         "mi": mi_dict,
     }
     save_pickle_standard(session_pickle_path, session_payload)
 
-    # Build per-neuron rows
+    # 5. Per-Neuron Rows
     neuron_rows = []
     for neuron_idx in range(n_neurons):
-        neuron_rows.append({
-            "dataset_name": row["dataset_name"],
-            "mouse_name": row["mouse_name"],
-            "session_name": row["session_name"],
-            "depth_type": row["depth_type"],
+        nrow = {
+            "dataset_name": row.get("dataset_name", ""),
+            "mouse_name": row.get("mouse_name", ""),
+            "session_name": row.get("session_name", ""),
+            "depth_type": row.get("depth_type", ""),
             "recording_type": recording_type,
-            "standardized_file_path": standardized_file_path,
+            "standardized_file_path": actual_file_path,
             "row_index": row_idx,
             "neuron_index": neuron_idx,
             "n_timepoints": n_timepoints,
             "n_neurons_in_session": n_neurons,
-            "mi_position": mi_dict["position"][neuron_idx] if mi_dict["position"] is not None else np.nan,
-            "mi_position_x_direction": mi_dict["position_x_direction"][neuron_idx] if mi_dict["position_x_direction"] is not None else np.nan,
-            "mi_speed": mi_dict["speed"][neuron_idx] if mi_dict["speed"] is not None else np.nan,
-            "mi_time": mi_dict["time"][neuron_idx] if mi_dict["time"] is not None else np.nan,
-            "mi_inner_time": mi_dict["inner_time"][neuron_idx] if mi_dict["inner_time"] is not None else np.nan,
-            "mi_direction": mi_dict["direction"][neuron_idx] if mi_dict["direction"] is not None else np.nan,
-            "mi_trial_id": mi_dict["trial_id"][neuron_idx] if mi_dict["trial_id"] is not None else np.nan,
-        })
+        }
+        for label in ALL_FEATURE_LABELS:
+            nrow[f"mi_{label}"] = mi_dict[label][neuron_idx] if mi_dict[label] is not None else np.nan
+        neuron_rows.append(nrow)
 
-    # Build session summary row
+    # 6. Session Summary Row
     session_row = {
-        "dataset_name": row["dataset_name"],
-        "mouse_name": row["mouse_name"],
-        "session_name": row["session_name"],
-        "depth_type": row["depth_type"],
+        "dataset_name": row.get("dataset_name", ""),
+        "mouse_name": row.get("mouse_name", ""),
+        "session_name": row.get("session_name", ""),
+        "depth_type": row.get("depth_type", ""),
         "recording_type": recording_type,
-        "standardized_file_path": standardized_file_path,
+        "standardized_file_path": actual_file_path,
         "row_index": row_idx,
         "n_timepoints": n_timepoints,
         "n_neurons": n_neurons,
-        "mi_position_mean": np.nanmean(mi_dict["position"]) if mi_dict["position"] is not None else np.nan,
-        "mi_position_std": np.nanstd(mi_dict["position"]) if mi_dict["position"] is not None else np.nan,
-        "mi_position_x_direction_mean": np.nanmean(mi_dict["position_x_direction"]) if mi_dict["position_x_direction"] is not None else np.nan,
-        "mi_position_x_direction_std": np.nanstd(mi_dict["position_x_direction"]) if mi_dict["position_x_direction"] is not None else np.nan,
-        "mi_speed_mean": np.nanmean(mi_dict["speed"]) if mi_dict["speed"] is not None else np.nan,
-        "mi_speed_std": np.nanstd(mi_dict["speed"]) if mi_dict["speed"] is not None else np.nan,
-        "mi_time_mean": np.nanmean(mi_dict["time"]) if mi_dict["time"] is not None else np.nan,
-        "mi_time_std": np.nanstd(mi_dict["time"]) if mi_dict["time"] is not None else np.nan,
-        "mi_inner_time_mean": np.nanmean(mi_dict["inner_time"]) if mi_dict["inner_time"] is not None else np.nan,
-        "mi_inner_time_std": np.nanstd(mi_dict["inner_time"]) if mi_dict["inner_time"] is not None else np.nan,
-        "mi_direction_mean": np.nanmean(mi_dict["direction"]) if mi_dict["direction"] is not None else np.nan,
-        "mi_direction_std": np.nanstd(mi_dict["direction"]) if mi_dict["direction"] is not None else np.nan,
-        "mi_trial_id_mean": np.nanmean(mi_dict["trial_id"]) if mi_dict["trial_id"] is not None else np.nan,
-        "mi_trial_id_std": np.nanstd(mi_dict["trial_id"]) if mi_dict["trial_id"] is not None else np.nan,
         "session_pickle_name": session_pickle_name,
         "session_pickle_path": session_pickle_path,
     }
+    for label in ALL_FEATURE_LABELS:
+        arr = mi_dict[label]
+        session_row[f"mi_{label}_mean"] = np.nanmean(arr) if arr is not None else np.nan
+        session_row[f"mi_{label}_std"] = np.nanstd(arr) if arr is not None else np.nan
 
     if VERBOSE:
+        has_theta_env = mi_dict.get("lfp_theta_envelope") is not None
+        theta_env_str = f"{session_row.get('mi_lfp_theta_envelope_mean', np.nan):.4f}" if has_theta_env else "N/A"
         print(
-            "  Means | "
-            f"pos={session_row['mi_position_mean']:.4f} | "
-            f"pos*dir={session_row['mi_position_x_direction_mean']:.4f} | "
+            f"   pos={session_row['mi_position_mean']:.4f} | "
             f"speed={session_row['mi_speed_mean']:.4f} | "
-            f"time={session_row['mi_time_mean']:.4f} | "
-            f"inner_time={session_row['mi_inner_time_mean']:.4f} | "
-            f"dir={session_row['mi_direction_mean']:.4f} | "
-            f"trial_id={session_row['mi_trial_id_mean']:.4f}"
+            f"theta_env={theta_env_str}"
         )
 
     return neuron_rows, session_row
 
 
 # =============================================================================
-# Main
+# Main Pipeline
 # =============================================================================
 
 def main():
@@ -511,9 +462,12 @@ def main():
     ensure_dir(LOG_DIR)
 
     if not os.path.isfile(CSV_PATH):
-        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+        raise FileNotFoundError(f"Master CSV index not found: {CSV_PATH}")
 
-    df = pd.read_csv(CSV_PATH)
+    try:
+        df = pd.read_csv(CSV_PATH, engine="python", on_bad_lines="skip")
+    except Exception:
+        df = pd.read_csv(CSV_PATH)
 
     if MAX_ROWS is not None:
         df = df.iloc[:MAX_ROWS].copy()
@@ -521,24 +475,19 @@ def main():
     init_csv(NEURON_MI_CSV, NEURON_MI_COLUMNS)
     init_csv(SESSION_MI_CSV, SESSION_MI_COLUMNS)
 
-    log_path = os.path.join(LOG_DIR, "mutual_information_log.txt")
+    log_path = os.path.join(LOG_DIR, "mutual_information_behavior_and_lfp_log.txt")
     log_file = open(log_path, "w", encoding="utf-8")
     original_stdout = os.sys.stdout
     os.sys.stdout = Tee(original_stdout, log_file)
 
     print("==============================================================")
-    print("Mutual Information analysis pipeline")
+    print("Mutual Information Pipeline: Behavior, LFP Envelopes & Phases")
     print(f"Started: {datetime.now():%Y-%m-%d %H:%M}")
     print("==============================================================")
     print(f"Input CSV: {CSV_PATH}")
-    print(f"Rows to process: {len(df)}")
-    print(f"Output dir: {OUTPUT_DIR}")
-    print(f"Neuron CSV: {NEURON_MI_CSV}")
-    print(f"Session CSV: {SESSION_MI_CSV}")
-    print(f"Session PKL dir: {SESSION_PKL_DIR}")
-    print(f"MI n_neighbors: {MI_N_NEIGHBORS}")
-    print(f"MI random_state: {MI_RANDOM_STATE}")
-    print("")
+    print(f"Sessions in index: {len(df)}")
+    print(f"Features: {len(ALL_FEATURE_LABELS)} (7 Behavior, 8 Waveform, 8 Envelope, 8 Phase)")
+    print(f"Output directory: {OUTPUT_DIR}\n")
 
     ok_count = 0
     fail_count = 0
@@ -556,7 +505,7 @@ def main():
 
             ok_count += 1
             elapsed = timeit.default_timer() - local_time
-            print(f"[OK] Row {row_idx} finished in {elapsed:.2f} s\n")
+            print(f"[OK] Row {row_idx} completed in {elapsed:.2f} s\n")
 
         except Exception as e:
             fail_count += 1
@@ -564,11 +513,11 @@ def main():
 
     total_elapsed = timeit.default_timer() - global_time
     print("==============================================================")
-    print("Done")
+    print("Mutual Information Analysis Complete")
     print(f"Finished: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"Successful entries: {ok_count}")
-    print(f"Failed entries: {fail_count}")
-    print(f"Total elapsed time: {total_elapsed:.2f} s")
+    print(f"Successful sessions: {ok_count} / {len(df)}")
+    print(f"Failed sessions    : {fail_count}")
+    print(f"Total elapsed time : {total_elapsed:.2f} s")
     print("==============================================================")
 
     os.sys.stdout = original_stdout

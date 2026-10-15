@@ -2,25 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-Train MIR-based clustering/openTSNE on the learning dataset and transfer
-the trained model to other datasets.
+Run MIR-based clustering and openTSNE inside each dataset independently.
 
-This version:
-1) Parses session date from session_name (YYYYMMDD_HHMMSS)
-2) Trains on latest session per mouse from the learning dataset
-3) Uses only MIR features
-4) Row-wise z-score across the 7 MIR behaviors
-5) StandardScaler across cells
-6) KMeans on training
-7) Uses 75% centroid-distance filtering ONLY during training
-8) Fits openTSNE on training
-9) Transfers to other datasets using ALL cells (no 75% exclusion on transfer)
-10) Saves neuron-level CSVs with original MI info + cluster_id + tsne coords + neuron_uid
-11) Adds statistics .txt files for every barplot
-12) For behavior × cluster plots, runs two-way ANOVA + pairwise Welch t-tests
-13) For lt_rot, splits ONLY using session_name containing 'lt' or 'rot'
-14) Fixes seaborn categorical palette issues and ticklabel warnings
-15) Fixes stats file writing bug and uses chi-square goodness-of-fit for 1D count bars
+Compared with the previous train-transfer script, this version:
+1) Does NOT train on learning and transfer to others
+2) For each dataset subset, fits its own:
+   - row-wise z-scored MIR features
+   - StandardScaler
+   - KMeans
+   - openTSNE
+3) Keeps the same cluster semantic mapping:
+   0 -> Time
+   1 -> Direction
+   2 -> Position
+   10 -> Unassigned
+4) Keeps the same colors and plotting style
+5) Saves one labeled neuron CSV + plots + stats per subset
+
+This is the "clustering_within_dataset" version.
 """
 
 import os
@@ -51,31 +50,13 @@ from statsmodels.formula.api import ols
 MI_CSV = "/home/melisamc/Documents/time_project_standarization/analysis/mutual_information/mutual_information_per_neuron.csv"
 MASTER_INDEX_CSV = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
 
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/mir_training_and_transfer"
-TRAIN_DIR = os.path.join(OUTPUT_DIR, "training")
-TRANSFER_DIR = os.path.join(OUTPUT_DIR, "transfer")
-
-TRAIN_MODEL_DIR = os.path.join(TRAIN_DIR, "models")
-TRAIN_DATA_DIR = os.path.join(TRAIN_DIR, "data")
-TRAIN_PNG_DIR = os.path.join(TRAIN_DIR, "png")
-TRAIN_SVG_DIR = os.path.join(TRAIN_DIR, "svg")
-TRAIN_STATS_DIR = os.path.join(TRAIN_DIR, "stats")
+OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/clustering_within_dataset"
 
 
 # =============================================================================
 # Parameters
 # =============================================================================
 
-# Replace with the exact dataset_name(s) for the learning dataset
-LEARNING_DATASET_NAMES = [
-    "learning",
-    "learning_dataset",
-]
-
-USE_LEARNERS_ONLY = False
-LEARNER_MICE = ["M2019", "M2023", "M2024", "M2025", "M2026"]
-
-# MIR features only, matching old code order
 MIR_FEATURE_COLUMNS = [
     "mi_position",
     "mi_position_x_direction",
@@ -117,7 +98,6 @@ MIR_VMAX_RAW = 0.35
 MIR_VMIN_Z = -1.0
 MIR_VMAX_Z = 3.5
 
-# cluster colors from previous code
 CLUSTER_COLOR_MAP = {
     2: "#ec8ef8ff",    # Position
     1: "#66cef4ff",    # Direction
@@ -156,37 +136,56 @@ DEPTH_COLOR_MAP = {
     "unknown": "gray",
 }
 
-# Adapt these if your dataset_name values differ
-TRANSFER_CONFIGS = [
+# Same subset logic as before, but each subset is clustered internally
+WITHIN_DATASET_CONFIGS = [
+    {
+        "name": "learning_latest_per_mouse",
+        "dataset_name_contains": ["learning"],
+        "subset_mode": "all",
+        "depth_mode": "all",
+        "latest_session_per_mouse": True,
+    },
     {
         "name": "lt_rot_lt",
         "dataset_name_contains": ["lt_rot"],
         "subset_mode": "lt_only",
         "depth_mode": "all",
+        "latest_session_per_mouse": False,
     },
     {
         "name": "lt_rot_rot",
         "dataset_name_contains": ["lt_rot"],
         "subset_mode": "rot_only",
         "depth_mode": "all",
+        "latest_session_per_mouse": False,
     },
     {
         "name": "ephys_whole",
         "dataset_name_contains": ["ephys"],
         "subset_mode": "all",
         "depth_mode": "whole_only",
+        "latest_session_per_mouse": False,
     },
     {
         "name": "ephys_deep_sup",
         "dataset_name_contains": ["ephys"],
         "subset_mode": "all",
         "depth_mode": "deep_sup_only",
+        "latest_session_per_mouse": False,
     },
     {
         "name": "egrin_all",
         "dataset_name_contains": ["egrin"],
         "subset_mode": "all",
         "depth_mode": "all",
+        "latest_session_per_mouse": False,
+    },
+    {
+        "name": "dreadds_all",
+        "dataset_name_contains": ["dreadds"],
+        "subset_mode": "all",
+        "depth_mode": "all",
+        "latest_session_per_mouse": False,
     },
 ]
 
@@ -262,37 +261,6 @@ def parse_session_datetime_from_name(session_name):
 def attach_session_datetime(df):
     out = df.copy()
     out["session_datetime"] = out["session_name"].apply(parse_session_datetime_from_name)
-    return out
-
-
-def infer_learning_dataset_mask(df):
-    dataset_lower = df["dataset_name"].astype(str).str.lower()
-    mask = pd.Series(False, index=df.index)
-    for name in LEARNING_DATASET_NAMES:
-        mask |= dataset_lower.eq(name.lower())
-    return mask
-
-
-def select_latest_session_per_mouse(df):
-    session_table = (
-        df[["mouse_name", "session_name", "session_datetime"]]
-        .drop_duplicates()
-        .sort_values(["mouse_name", "session_datetime", "session_name"])
-    )
-
-    latest_per_mouse = (
-        session_table.groupby("mouse_name", as_index=False)["session_datetime"]
-        .max()
-        .rename(columns={"session_datetime": "latest_datetime"})
-    )
-
-    session_table = session_table.merge(latest_per_mouse, on="mouse_name", how="left")
-
-    keep_sessions = session_table[
-        session_table["session_datetime"] == session_table["latest_datetime"]
-    ][["mouse_name", "session_name"]].drop_duplicates()
-
-    out = df.merge(keep_sessions, on=["mouse_name", "session_name"], how="inner")
     return out
 
 
@@ -374,10 +342,6 @@ def run_cluster_count_gof_test(counts_df, cluster_col="cluster_str", count_col="
         txt.append("Test not computed: fewer than 2 clusters present.\n")
         return "".join(txt)
 
-    if np.any(observed < 0):
-        txt.append("Test not computed: negative counts found.\n")
-        return "".join(txt)
-
     total = observed.sum()
     if total <= 0:
         txt.append("Test not computed: total count is zero.\n")
@@ -409,10 +373,6 @@ def run_chi_square_counts(counts_df, row_var, col_var, count_var="count"):
 
     if pivot.shape[0] < 2 or pivot.shape[1] < 2:
         txt.append("Test not computed: contingency table must be at least 2x2.\n")
-        return "".join(txt)
-
-    if np.any(pivot.values < 0):
-        txt.append("Test not computed: negative counts found.\n")
         return "".join(txt)
 
     try:
@@ -542,96 +502,84 @@ def run_two_way_anova_and_pairs(df, factor_a, factor_b, value_col, title):
 
 
 # =============================================================================
-# Training / transfer models
+# Metadata merge / filtering
 # =============================================================================
 
-def fit_training_models(df_train):
-    X_raw = df_train[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
+def merge_master_metadata(df_mi, df_master):
+    join_cols = ["dataset_name", "mouse_name", "session_name", "depth_type"]
+    add_cols = [c for c in ["modality", "paradigm", "model", "created_at", "notes"] if c in df_master.columns]
+    master_sub = df_master[join_cols + add_cols].drop_duplicates().copy()
+    out = df_mi.merge(master_sub, on=join_cols, how="left")
+    return out
 
-    valid_mask = np.all(np.isfinite(X_raw), axis=1)
-    df_train = df_train.loc[valid_mask].copy().reset_index(drop=True)
-    X_raw = X_raw[valid_mask]
 
-    if len(df_train) == 0:
-        raise ValueError("All training rows were removed due to invalid MIR values.")
+def dataset_name_mask(df, substrings):
+    mask = pd.Series(False, index=df.index)
+    name_lower = df["dataset_name"].astype(str).str.lower()
+    for ss in substrings:
+        mask |= name_lower.str.contains(str(ss).lower(), na=False)
+    return mask
 
-    X_z = rowwise_zscore(X_raw)
 
-    z_cols = [f"z_{c}" for c in MIR_FEATURE_COLUMNS]
-    for j, col in enumerate(z_cols):
-        df_train[col] = X_z[:, j]
+def subset_lt_rot(df, mode):
+    if mode == "all":
+        return df.copy()
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_z)
+    sess = df["session_name"].astype(str).str.lower()
 
-    kmeans = KMeans(
-        n_clusters=N_CLUSTERS,
-        random_state=KMEANS_RANDOM_STATE,
-        n_init=KMEANS_N_INIT,
+    if mode == "lt_only":
+        return df[sess.str.contains("lt", na=False)].copy()
+
+    if mode == "rot_only":
+        return df[sess.str.contains("rot", na=False)].copy()
+
+    return df.copy()
+
+
+def subset_by_depth_mode(df, depth_mode):
+    depth_norm = df["depth_type"].apply(normalize_depth_label)
+
+    if depth_mode == "all":
+        return df.copy()
+
+    if depth_mode == "whole_only":
+        return df[depth_norm == "whole population"].copy()
+
+    if depth_mode == "deep_sup_only":
+        return df[depth_norm.isin(["deep", "superficial"])].copy()
+
+    return df.copy()
+
+
+def select_latest_session_per_mouse(df):
+    session_table = (
+        df[["mouse_name", "session_name", "session_datetime"]]
+        .drop_duplicates()
+        .sort_values(["mouse_name", "session_datetime", "session_name"])
     )
-    initial_labels = kmeans.fit_predict(X_scaled)
-    centroids = kmeans.cluster_centers_
 
-    keep_labels = np.full(len(X_scaled), UNASSIGNED_LABEL, dtype=int)
-    thresholds = {}
-
-    for cid in range(N_CLUSTERS):
-        cluster_indices = np.where(initial_labels == cid)[0]
-        if len(cluster_indices) == 0:
-            thresholds[cid] = np.nan
-            continue
-
-        cluster_points = X_scaled[cluster_indices]
-        centroid = centroids[cid]
-        dists = np.linalg.norm(cluster_points - centroid, axis=1)
-        threshold = np.percentile(dists, KEEP_PERCENTILE)
-        thresholds[cid] = float(threshold)
-
-        keep_mask = dists <= threshold
-        keep_indices = cluster_indices[keep_mask]
-        keep_labels[keep_indices] = cid
-
-    remap_dict = infer_cluster_semantic_mapping(df_train, keep_labels)
-    semantic_labels = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in keep_labels], dtype=int)
-    raw_pred_semantic = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in initial_labels], dtype=int)
-
-    tsne = TSNE(
-        n_components=2,
-        perplexity=TSNE_PERPLEXITY,
-        initialization=TSNE_INITIALIZATION,
-        metric=TSNE_METRIC,
-        n_jobs=TSNE_N_JOBS,
-        random_state=TSNE_RANDOM_STATE,
-        verbose=True,
+    latest_per_mouse = (
+        session_table.groupby("mouse_name", as_index=False)["session_datetime"]
+        .max()
+        .rename(columns={"session_datetime": "latest_datetime"})
     )
-    tsne_embedding = tsne.fit(X_scaled)
-    emb_np = np.asarray(tsne_embedding)
 
-    df_train["cluster_initial"] = initial_labels
-    df_train["cluster_id"] = semantic_labels
-    df_train["cluster_pred_semantic"] = raw_pred_semantic
-    df_train["tsne_1"] = emb_np[:, 0]
-    df_train["tsne_2"] = emb_np[:, 1]
+    session_table = session_table.merge(latest_per_mouse, on="mouse_name", how="left")
 
-    model_package = {
-        "scaler": scaler,
-        "kmeans": kmeans,
-        "tsne_embedding_model": tsne_embedding,
-        "thresholds_raw_cluster": thresholds,
-        "cluster_remap_raw_to_semantic": remap_dict,
-        "feature_columns": MIR_FEATURE_COLUMNS,
-        "z_feature_columns": z_cols,
-        "n_clusters": N_CLUSTERS,
-        "keep_percentile": KEEP_PERCENTILE,
-        "unassigned_label": UNASSIGNED_LABEL,
-        "centroids_raw": centroids,
-    }
+    keep_sessions = session_table[
+        session_table["session_datetime"] == session_table["latest_datetime"]
+    ][["mouse_name", "session_name"]].drop_duplicates()
 
-    return df_train, X_raw, X_z, X_scaled, emb_np, model_package
+    out = df.merge(keep_sessions, on=["mouse_name", "session_name"], how="inner")
+    return out
 
 
-def infer_cluster_semantic_mapping(df_train, raw_keep_labels):
-    tmp = df_train.copy()
+# =============================================================================
+# Within-dataset clustering models
+# =============================================================================
+
+def infer_cluster_semantic_mapping(df_subset, raw_keep_labels):
+    tmp = df_subset.copy()
     tmp["raw_keep_label"] = raw_keep_labels
     tmp = tmp[tmp["raw_keep_label"] != UNASSIGNED_LABEL].copy()
 
@@ -673,99 +621,89 @@ def infer_cluster_semantic_mapping(df_train, raw_keep_labels):
     return remap
 
 
-def apply_trained_model(df_target, model_package):
-    """
-    Transfer version: ALL cells included, no 75% exclusion.
-    """
-    scaler = model_package["scaler"]
-    kmeans = model_package["kmeans"]
-    tsne_embedding_model = model_package["tsne_embedding_model"]
-    remap_dict = model_package["cluster_remap_raw_to_semantic"]
-
-    X_raw = df_target[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
+def fit_within_dataset_models(df_subset):
+    X_raw = df_subset[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
 
     valid_mask = np.all(np.isfinite(X_raw), axis=1)
-    df_target = df_target.loc[valid_mask].copy().reset_index(drop=True)
+    df_subset = df_subset.loc[valid_mask].copy().reset_index(drop=True)
     X_raw = X_raw[valid_mask]
 
-    if len(df_target) == 0:
-        raise ValueError("All target rows were removed due to invalid MIR values.")
+    if len(df_subset) == 0:
+        raise ValueError("All rows were removed due to invalid MIR values.")
 
     X_z = rowwise_zscore(X_raw)
+
     z_cols = [f"z_{c}" for c in MIR_FEATURE_COLUMNS]
     for j, col in enumerate(z_cols):
-        df_target[col] = X_z[:, j]
+        df_subset[col] = X_z[:, j]
 
-    X_scaled = scaler.transform(X_z)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_z)
 
-    raw_pred = kmeans.predict(X_scaled)
-    final_semantic = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in raw_pred], dtype=int)
+    kmeans = KMeans(
+        n_clusters=N_CLUSTERS,
+        random_state=KMEANS_RANDOM_STATE,
+        n_init=KMEANS_N_INIT,
+    )
+    initial_labels = kmeans.fit_predict(X_scaled)
+    centroids = kmeans.cluster_centers_
 
-    transformed = tsne_embedding_model.transform(X_scaled)
-    emb_np = np.asarray(transformed)
+    keep_labels = np.full(len(X_scaled), UNASSIGNED_LABEL, dtype=int)
+    thresholds = {}
 
-    df_target["cluster_initial"] = raw_pred
-    df_target["cluster_pred_semantic"] = final_semantic
-    df_target["cluster_id"] = final_semantic
-    df_target["tsne_1"] = emb_np[:, 0]
-    df_target["tsne_2"] = emb_np[:, 1]
+    for cid in range(N_CLUSTERS):
+        cluster_indices = np.where(initial_labels == cid)[0]
+        if len(cluster_indices) == 0:
+            thresholds[cid] = np.nan
+            continue
 
-    return df_target, X_raw, X_z, X_scaled, emb_np
+        cluster_points = X_scaled[cluster_indices]
+        centroid = centroids[cid]
+        dists = np.linalg.norm(cluster_points - centroid, axis=1)
+        threshold = np.percentile(dists, KEEP_PERCENTILE)
+        thresholds[cid] = float(threshold)
 
+        keep_mask = dists <= threshold
+        keep_indices = cluster_indices[keep_mask]
+        keep_labels[keep_indices] = cid
 
-# =============================================================================
-# Metadata merge / filtering
-# =============================================================================
+    remap_dict = infer_cluster_semantic_mapping(df_subset, keep_labels)
+    semantic_labels = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in keep_labels], dtype=int)
+    raw_pred_semantic = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in initial_labels], dtype=int)
 
-def merge_master_metadata(df_mi, df_master):
-    join_cols = ["dataset_name", "mouse_name", "session_name", "depth_type"]
-    add_cols = [c for c in ["modality", "paradigm", "model", "created_at", "notes"] if c in df_master.columns]
-    master_sub = df_master[join_cols + add_cols].drop_duplicates().copy()
-    out = df_mi.merge(master_sub, on=join_cols, how="left")
-    return out
+    tsne = TSNE(
+        n_components=2,
+        perplexity=TSNE_PERPLEXITY,
+        initialization=TSNE_INITIALIZATION,
+        metric=TSNE_METRIC,
+        n_jobs=TSNE_N_JOBS,
+        random_state=TSNE_RANDOM_STATE,
+        verbose=True,
+    )
+    tsne_embedding = tsne.fit(X_scaled)
+    emb_np = np.asarray(tsne_embedding)
 
+    df_subset["cluster_initial"] = initial_labels
+    df_subset["cluster_id"] = semantic_labels
+    df_subset["cluster_pred_semantic"] = raw_pred_semantic
+    df_subset["tsne_1"] = emb_np[:, 0]
+    df_subset["tsne_2"] = emb_np[:, 1]
 
-def dataset_name_mask(df, substrings):
-    mask = pd.Series(False, index=df.index)
-    name_lower = df["dataset_name"].astype(str).str.lower()
-    for ss in substrings:
-        mask |= name_lower.str.contains(str(ss).lower(), na=False)
-    return mask
+    model_package = {
+        "scaler": scaler,
+        "kmeans": kmeans,
+        "tsne_embedding_model": tsne_embedding,
+        "thresholds_raw_cluster": thresholds,
+        "cluster_remap_raw_to_semantic": remap_dict,
+        "feature_columns": MIR_FEATURE_COLUMNS,
+        "z_feature_columns": z_cols,
+        "n_clusters": N_CLUSTERS,
+        "keep_percentile": KEEP_PERCENTILE,
+        "unassigned_label": UNASSIGNED_LABEL,
+        "centroids_raw": centroids,
+    }
 
-
-def subset_lt_rot(df, mode):
-    """
-    Uses ONLY session_name:
-      - 'lt' in session_name -> LT
-      - 'rot' in session_name -> ROT
-    """
-    if mode == "all":
-        return df.copy()
-
-    sess = df["session_name"].astype(str).str.lower()
-
-    if mode == "lt_only":
-        return df[sess.str.contains("lt", na=False)].copy()
-
-    if mode == "rot_only":
-        return df[sess.str.contains("rot", na=False)].copy()
-
-    return df.copy()
-
-
-def subset_by_depth_mode(df, depth_mode):
-    depth_norm = df["depth_type"].apply(normalize_depth_label)
-
-    if depth_mode == "all":
-        return df.copy()
-
-    if depth_mode == "whole_only":
-        return df[depth_norm == "whole population"].copy()
-
-    if depth_mode == "deep_sup_only":
-        return df[depth_norm.isin(["deep", "superficial"])].copy()
-
-    return df.copy()
+    return df_subset, X_raw, X_z, X_scaled, emb_np, model_package
 
 
 # =============================================================================
@@ -1089,13 +1027,6 @@ def save_labeled_neuron_csv(df_labeled, out_dir, file_name):
 
 def main():
     ensure_dir(OUTPUT_DIR)
-    ensure_dir(TRAIN_DIR)
-    ensure_dir(TRANSFER_DIR)
-    ensure_dir(TRAIN_MODEL_DIR)
-    ensure_dir(TRAIN_DATA_DIR)
-    ensure_dir(TRAIN_PNG_DIR)
-    ensure_dir(TRAIN_SVG_DIR)
-    ensure_dir(TRAIN_STATS_DIR)
 
     if not os.path.isfile(MI_CSV):
         raise FileNotFoundError(f"MI CSV not found: {MI_CSV}")
@@ -1119,132 +1050,22 @@ def main():
     df_all = attach_session_datetime(df_all)
     df_all = add_neuron_uid(df_all)
 
-    # -------------------------------------------------------------------------
-    # TRAINING
-    # -------------------------------------------------------------------------
-    learning_mask = infer_learning_dataset_mask(df_all)
-    df_learning = df_all[learning_mask].copy()
-
-    if USE_LEARNERS_ONLY:
-        df_learning = df_learning[df_learning["mouse_name"].isin(LEARNER_MICE)].copy()
-
-    if len(df_learning) == 0:
-        raise ValueError(
-            f"No rows matched LEARNING_DATASET_NAMES={LEARNING_DATASET_NAMES}. "
-            "Edit those names to the exact dataset_name values printed above."
-        )
-
-    if df_learning["session_datetime"].isna().all():
-        raise ValueError(
-            "Could not parse dates from session_name in the learning dataset. "
-            "Expected format like 20150228_174527."
-        )
-
-    df_train = select_latest_session_per_mouse(df_learning).copy()
-
-    if len(df_train) == 0:
-        raise ValueError("No training rows remained after selecting latest session per mouse.")
-
-    print(f"\nTraining rows: {len(df_train)}")
-    print("Training mice:", sorted(df_train["mouse_name"].dropna().astype(str).unique().tolist()))
-    print("Training sessions:", sorted(df_train["session_name"].dropna().astype(str).unique().tolist()))
-
-    df_train_labeled, X_raw, X_z, X_scaled, emb_np, model_package = fit_training_models(df_train)
-
-    save_pickle(os.path.join(TRAIN_MODEL_DIR, "model_package.pkl"), model_package)
-    np.save(os.path.join(TRAIN_MODEL_DIR, "training_X_raw.npy"), X_raw)
-    np.save(os.path.join(TRAIN_MODEL_DIR, "training_X_z.npy"), X_z)
-    np.save(os.path.join(TRAIN_MODEL_DIR, "training_X_scaled.npy"), X_scaled)
-    np.save(os.path.join(TRAIN_MODEL_DIR, "training_tsne_embedding.npy"), emb_np)
-
-    metadata = {
-        "learning_dataset_names": LEARNING_DATASET_NAMES,
-        "use_learners_only": USE_LEARNERS_ONLY,
-        "learner_mice": LEARNER_MICE,
-        "mir_feature_columns": MIR_FEATURE_COLUMNS,
-        "n_clusters": N_CLUSTERS,
-        "unassigned_label": UNASSIGNED_LABEL,
-        "keep_percentile": KEEP_PERCENTILE,
-        "cluster_colors": CLUSTER_COLOR_MAP,
-        "cluster_names": CLUSTER_NAME_MAP,
-        "cluster_remap_raw_to_semantic": model_package["cluster_remap_raw_to_semantic"],
-        "thresholds_raw_cluster": model_package["thresholds_raw_cluster"],
-        "training_rows": int(len(df_train_labeled)),
-    }
-    with open(os.path.join(TRAIN_MODEL_DIR, "training_metadata.json"), "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-
-    save_labeled_neuron_csv(
-        df_train_labeled,
-        TRAIN_DATA_DIR,
-        "learning_last_session_mir_labeled_neurons.csv"
-    )
-
-    plot_embedding_grid(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        "training_MIR_clusters_grid",
-        use_z=True,
-        add_depth=True
-    )
-    plot_cluster_counts(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        TRAIN_STATS_DIR,
-        "training_cluster_counts"
-    )
-    plot_cluster_counts_per_mouse(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        TRAIN_STATS_DIR,
-        "training_cluster_counts_per_mouse"
-    )
-    plot_cluster_counts_by_depth(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        TRAIN_STATS_DIR,
-        "training_cluster_counts_by_depth"
-    )
-    plot_cluster_information_barplot(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        TRAIN_STATS_DIR,
-        "training_cluster_information_barplot",
-        use_z=False,
-        small=False
-    )
-    plot_cluster_information_barplot(
-        df_train_labeled,
-        TRAIN_PNG_DIR,
-        TRAIN_SVG_DIR,
-        TRAIN_STATS_DIR,
-        "training_cluster_information_barplot_small",
-        use_z=False,
-        small=True
-    )
-
-    # -------------------------------------------------------------------------
-    # TRANSFER
-    # -------------------------------------------------------------------------
-    print("\nStarting transfer...")
-    for cfg in TRANSFER_CONFIGS:
+    for cfg in WITHIN_DATASET_CONFIGS:
         name = cfg["name"]
-        print(f"\n=== Transfer subset: {name} ===")
+        print(f"\n=== Within-dataset clustering: {name} ===")
 
-        subset_out_dir = os.path.join(TRANSFER_DIR, sanitize_for_filename(name))
+        subset_out_dir = os.path.join(OUTPUT_DIR, sanitize_for_filename(name))
         subset_data_dir = os.path.join(subset_out_dir, "data")
         subset_png_dir = os.path.join(subset_out_dir, "png")
         subset_svg_dir = os.path.join(subset_out_dir, "svg")
         subset_stats_dir = os.path.join(subset_out_dir, "stats")
+        subset_model_dir = os.path.join(subset_out_dir, "models")
+
         ensure_dir(subset_data_dir)
         ensure_dir(subset_png_dir)
         ensure_dir(subset_svg_dir)
         ensure_dir(subset_stats_dir)
+        ensure_dir(subset_model_dir)
 
         mask = dataset_name_mask(df_all, cfg["dataset_name_contains"])
         df_subset = df_all[mask].copy()
@@ -1256,31 +1077,53 @@ def main():
         df_subset = subset_lt_rot(df_subset, cfg["subset_mode"])
         df_subset = subset_by_depth_mode(df_subset, cfg["depth_mode"])
 
+        if cfg.get("latest_session_per_mouse", False):
+            df_subset = select_latest_session_per_mouse(df_subset)
+
         if len(df_subset) == 0:
-            print(f"[WARNING] No rows remained after subset/depth filtering for {name}.")
+            print(f"[WARNING] No rows remained after filtering for {name}.")
             continue
 
+        print(f"Rows in subset: {len(df_subset)}")
+        print("Dataset names:", sorted(df_subset["dataset_name"].dropna().astype(str).unique().tolist()))
+        print("Mice:", sorted(df_subset["mouse_name"].dropna().astype(str).unique().tolist()))
+        print("Sessions:", sorted(df_subset["session_name"].dropna().astype(str).unique().tolist()))
+
         try:
-            df_applied, Xr, Xz, Xs, emb = apply_trained_model(df_subset, model_package)
+            df_labeled, X_raw, X_z, X_scaled, emb_np, model_package = fit_within_dataset_models(df_subset)
         except Exception as e:
             print(f"[WARNING] Failed on subset {name}: {e}")
             continue
 
+        save_pickle(os.path.join(subset_model_dir, "model_package.pkl"), model_package)
+        np.save(os.path.join(subset_model_dir, "X_raw.npy"), X_raw)
+        np.save(os.path.join(subset_model_dir, "X_z.npy"), X_z)
+        np.save(os.path.join(subset_model_dir, "X_scaled.npy"), X_scaled)
+        np.save(os.path.join(subset_model_dir, "embedding.npy"), emb_np)
+
+        subset_meta = {
+            "name": name,
+            "rows": int(len(df_labeled)),
+            "dataset_names": sorted(df_labeled["dataset_name"].dropna().astype(str).unique().tolist()),
+            "mice": sorted(df_labeled["mouse_name"].dropna().astype(str).unique().tolist()),
+            "sessions": sorted(df_labeled["session_name"].dropna().astype(str).unique().tolist()),
+            "depths": sorted(df_labeled["depth_type"].dropna().astype(str).unique().tolist()),
+            "cluster_remap_raw_to_semantic": model_package["cluster_remap_raw_to_semantic"],
+            "thresholds_raw_cluster": model_package["thresholds_raw_cluster"],
+        }
+        with open(os.path.join(subset_out_dir, "subset_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(subset_meta, f, indent=2)
+
         save_labeled_neuron_csv(
-            df_applied,
+            df_labeled,
             subset_data_dir,
             f"{sanitize_for_filename(name)}_mir_labeled_neurons.csv"
         )
 
-        np.save(os.path.join(subset_data_dir, f"{sanitize_for_filename(name)}_X_raw.npy"), Xr)
-        np.save(os.path.join(subset_data_dir, f"{sanitize_for_filename(name)}_X_z.npy"), Xz)
-        np.save(os.path.join(subset_data_dir, f"{sanitize_for_filename(name)}_X_scaled.npy"), Xs)
-        np.save(os.path.join(subset_data_dir, f"{sanitize_for_filename(name)}_embedding.npy"), emb)
-
-        add_depth = df_applied["depth_type"].apply(normalize_depth_label).isin(["deep", "superficial"]).any()
+        add_depth = df_labeled["depth_type"].apply(normalize_depth_label).isin(["deep", "superficial"]).any()
 
         plot_embedding_grid(
-            df_applied,
+            df_labeled,
             subset_png_dir,
             subset_svg_dir,
             f"{sanitize_for_filename(name)}_clusters_grid",
@@ -1288,14 +1131,14 @@ def main():
             add_depth=add_depth
         )
         plot_cluster_counts(
-            df_applied,
+            df_labeled,
             subset_png_dir,
             subset_svg_dir,
             subset_stats_dir,
             f"{sanitize_for_filename(name)}_cluster_counts"
         )
         plot_cluster_counts_per_mouse(
-            df_applied,
+            df_labeled,
             subset_png_dir,
             subset_svg_dir,
             subset_stats_dir,
@@ -1304,7 +1147,7 @@ def main():
 
         if add_depth:
             plot_cluster_counts_by_depth(
-                df_applied,
+                df_labeled,
                 subset_png_dir,
                 subset_svg_dir,
                 subset_stats_dir,
@@ -1312,7 +1155,7 @@ def main():
             )
 
         plot_cluster_information_barplot(
-            df_applied,
+            df_labeled,
             subset_png_dir,
             subset_svg_dir,
             subset_stats_dir,
@@ -1321,7 +1164,7 @@ def main():
             small=False
         )
         plot_cluster_information_barplot(
-            df_applied,
+            df_labeled,
             subset_png_dir,
             subset_svg_dir,
             subset_stats_dir,
@@ -1329,17 +1172,6 @@ def main():
             use_z=False,
             small=True
         )
-
-        subset_meta = {
-            "name": name,
-            "rows": int(len(df_applied)),
-            "dataset_names": sorted(df_applied["dataset_name"].dropna().astype(str).unique().tolist()),
-            "mice": sorted(df_applied["mouse_name"].dropna().astype(str).unique().tolist()),
-            "sessions": sorted(df_applied["session_name"].dropna().astype(str).unique().tolist()),
-            "depths": sorted(df_applied["depth_type"].dropna().astype(str).unique().tolist()),
-        }
-        with open(os.path.join(subset_out_dir, "subset_metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(subset_meta, f, indent=2)
 
         print(f"[OK] Finished subset: {name}")
 

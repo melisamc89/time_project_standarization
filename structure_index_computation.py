@@ -2,19 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Structure Index analysis pipeline in UMAP space.
-
-This version assumes you already have the Structure Index code available
-locally and importable from your environment.
+Structure Index analysis pipeline in Complete Neural Space.
 
 What this script does
 ---------------------
-1) Reads the UMAP/PCA analysis index CSV.
-2) Loads each saved embedding-behavior pickle.
-3) Uses the UMAP embedding (3D) as the data space for Structure Index.
-4) Removes time points where mov_dir == 0.
-5) Filters noisy outliers in UMAP space.
-6) Computes Structure Index (SI) for:
+1) Reads the Master Dataset Index CSV (or UMAP analysis index).
+2) Loads each standardized session pickle to obtain the full neural signal (T x N).
+3) Uses the high-dimensional neural activity matrix as the data space for Structure Index.
+4) Filters timepoints where mov_dir == 0.
+5) Filters noisy outliers in the full neural space via density thresholding.
+6) Computes Structure Index (SI) in full neural space for:
        - position
        - speed
        - time
@@ -24,8 +21,8 @@ What this script does
        - position_direction  (2D label: [position, direction])
 7) Saves:
        - one CSV with one row per session
-       - one pickle per session with full SI outputs
-       - one log txt file
+       - one pickle per session with full SI details
+       - one execution log file
 """
 
 import os
@@ -33,47 +30,56 @@ import csv
 import pickle
 import copy
 import timeit
+import re
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
-
+from scipy.ndimage import gaussian_filter1d
 from sklearn.metrics import pairwise_distances
+
+# Local Structure Index module
 from structure_index import compute_structure_index
 
-
 # =============================================================================
-# Paths
+# Paths & Settings
 # =============================================================================
 
-ANALYSIS_INDEX_CSV = "/home/melisamc/Documents/time_project_standarization/analysis/umap_pca_per_row/umap_pca_analysis_index.csv"
+POSSIBLE_ROOTS = [
+    "/home/hippolab/Documents/melisa/time_project_standarization",
+    "/home/melisamc/Documents/time_project_standarization",
+]
+PROJECT_ROOT = next((p for p in POSSIBLE_ROOTS if os.path.isdir(p)), POSSIBLE_ROOTS[0])
 
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/structure_index_umap"
+# Primary master metadata index
+MASTER_INDEX_CSV = os.path.join(PROJECT_ROOT, "data", "metadata", "master_dataset_index.csv")
+
+# Output directory for neural space Structure Index
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "analysis", "structure_index_neural_space")
 SESSION_PKL_DIR = os.path.join(OUTPUT_DIR, "session_pickles")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 
-SI_SESSION_CSV = os.path.join(OUTPUT_DIR, "structure_index_umap_per_session.csv")
-
+SI_SESSION_CSV = os.path.join(OUTPUT_DIR, "structure_index_neural_space_per_session.csv")
 
 # =============================================================================
 # Parameters
 # =============================================================================
 
+DATASET_FILTER = "None"  # Set to None to run across all datasets, or 'dreadds'
 MAX_ROWS = None
-VERBOSE = False
+SMOOTH_SIGMA = 6  # Set to 0 if signal is already smoothed in your standardized pkl
+Z_SCORE_NEURONS = False
 
-# Outlier filtering parameters
+# Outlier filtering parameters in neural space
 OUTLIER_DIST_TH = 5
 OUTLIER_NOISE_TH = 25
-
-# Which embedding to use: "umap" or "pca"
-EMBEDDING_KEY = "umap"
 
 SI_PARAMS_CONTINUOUS = {
     "n_bins": 10,
     "discrete_label": False,
     "continuity_kernel": None,
     "perc_neigh": 1,
+    "n_neighbors": 50,
     "num_shuffles": 0,
     "verbose": False,
 }
@@ -114,6 +120,29 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+def resolve_path(file_path):
+    if not file_path or pd.isna(file_path):
+        return ""
+    file_path = str(file_path).strip()
+
+    # Try direct existence
+    if os.path.exists(file_path):
+        return file_path
+    if os.path.exists(file_path + ".pkl"):
+        return file_path + ".pkl"
+
+    # Cross-machine prefix swapping
+    for src_root in POSSIBLE_ROOTS:
+        for dst_root in POSSIBLE_ROOTS:
+            if src_root in file_path:
+                cand = file_path.replace(src_root, dst_root)
+                if os.path.exists(cand):
+                    return cand
+                if os.path.exists(cand + ".pkl"):
+                    return cand + ".pkl"
+    return file_path
+
+
 def load_pickle_standard(file_path):
     with open(file_path, "rb") as f:
         return pickle.load(f)
@@ -125,28 +154,26 @@ def save_pickle_standard(file_path, obj):
 
 
 def ensure_1d(x):
+    if x is None:
+        return None
     x = np.asarray(x)
     if x.ndim == 2 and x.shape[1] == 1:
         x = x[:, 0]
     return x.reshape(-1)
 
 
-def ensure_2d(x):
-    x = np.asarray(x)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    return x
+def normalize_01(x):
+    x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return x
+    xmin, xmax = np.nanmin(x), np.nanmax(x)
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
+        return np.zeros_like(x)
+    return (x - xmin) / (xmax - xmin)
 
 
 def sanitize_for_filename(text):
-    text = str(text)
-    safe = []
-    for ch in text:
-        if ch.isalnum() or ch in ["-", "_"]:
-            safe.append(ch)
-        else:
-            safe.append("_")
-    return "".join(safe)
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text))
 
 
 def base_name_from_row(row_idx, row):
@@ -157,32 +184,6 @@ def base_name_from_row(row_idx, row):
         f"{sanitize_for_filename(row.get('session_name', 'unknown_session'))}_"
         f"{sanitize_for_filename(row.get('depth_type', 'unknown_depth'))}"
     )
-
-
-def infer_recording_type(row):
-    text_to_search = " ".join([
-        str(row.get("dataset_name", "")),
-        str(row.get("analysis_file_path", "")),
-    ]).lower()
-
-    if any(k in text_to_search for k in ["calcium", "caim", "dff", "trace"]):
-        return "calcium"
-    if any(k in text_to_search for k in ["ephys", "lfp", "spike", "electro"]):
-        return "ephys"
-
-    return "unknown"
-
-
-def validate_lengths(data_space, behavior_dict, row_idx):
-    n_time = data_space.shape[0]
-    for key, value in behavior_dict.items():
-        if value is None:
-            continue
-        if len(value) != n_time:
-            raise ValueError(
-                f"Row {row_idx}: length mismatch for '{key}' "
-                f"({len(value)} vs {n_time})"
-            )
 
 
 class Tee:
@@ -200,34 +201,17 @@ class Tee:
 
 
 # =============================================================================
-# Noisy outlier filtering
+# Outlier Filtering
 # =============================================================================
 
 def filter_noisy_outliers(data, D=None, dist_th=5, noise_th=25):
-    """
-    Filter outliers based on local density.
-
-    Parameters
-    ----------
-    data : numpy array [t, n]
-        t: timestamps; n: features
-    D : numpy array [t, t] or None
-        matrix of distances between rows
-    dist_th : float
-        percentile distance threshold below which a point is considered neighbor
-    noise_th : float
-        percentile threshold in number of neighbors below which points are outliers
-
-    Returns
-    -------
-    noise_idx : np.ndarray
-    signal_idx : np.ndarray
-    """
+    """Density-based outlier rejection in the provided data space."""
     if D is None:
         D = pairwise_distances(data)
 
-    np.fill_diagonal(D, np.nan)
-    nn_dist = np.sum(D < np.nanpercentile(D, dist_th), axis=1)
+    D_work = D.copy()
+    np.fill_diagonal(D_work, np.nan)
+    nn_dist = np.sum(D_work < np.nanpercentile(D_work, dist_th), axis=1)
     noise_idx = np.where(nn_dist < np.percentile(nn_dist, noise_th))[0]
     signal_idx = np.where(nn_dist >= np.percentile(nn_dist, noise_th))[0]
 
@@ -235,16 +219,50 @@ def filter_noisy_outliers(data, D=None, dist_th=5, noise_th=25):
 
 
 # =============================================================================
-# Behavior parsing
+# Behavior Parsing
 # =============================================================================
+
+def extract_behavior_dict(data, n_timepoints):
+    pos = data.get("pos", data.get("position", None))
+    if pos is not None:
+        pos = np.asarray(pos)
+        pos = pos[:, 0] if pos.ndim == 2 else pos.reshape(-1)
+
+    time_vec = ensure_1d(data.get("time", None))
+    if time_vec is None:
+        time_vec = np.arange(n_timepoints, dtype=float)
+
+    mov_dir = ensure_1d(data.get("mov_dir", data.get("direction", None)))
+    if mov_dir is None:
+        mov_dir = np.zeros(n_timepoints, dtype=float)
+
+    speed = ensure_1d(data.get("speed", None))
+    if speed is None and pos is not None and len(pos) > 1:
+        dt = np.median(np.diff(time_vec)) if len(time_vec) > 1 else 1.0
+        speed = np.abs(np.gradient(pos, dt))
+
+    inner_time = ensure_1d(data.get("inner_time", None))
+    if inner_time is None:
+        inner_time = normalize_01(time_vec)
+
+    trial_id = ensure_1d(data.get("trial_id", None))
+
+    return {
+        "position": pos,
+        "speed": speed,
+        "time": time_vec,
+        "inner_time": inner_time,
+        "trial_id": trial_id,
+        "direction": mov_dir,
+    }
+
 
 def get_si_params_for_behavior(behavior_name, behavior_values):
     if behavior_name in ["position", "speed", "time", "inner_time", "trial_id"]:
         params = copy.deepcopy(SI_PARAMS_CONTINUOUS)
-        params["n_neighbors"] = 50
         if behavior_name == "trial_id":
-            params["min_label"] = float(np.min(behavior_values))
-            params["max_label"] = float(np.max(behavior_values))
+            params["min_label"] = float(np.nanmin(behavior_values))
+            params["max_label"] = float(np.nanmax(behavior_values))
         return params
 
     if behavior_name == "direction":
@@ -257,7 +275,7 @@ def get_si_params_for_behavior(behavior_name, behavior_values):
 
 
 # =============================================================================
-# CSV schema
+# CSV Schema
 # =============================================================================
 
 SI_SESSION_COLUMNS = [
@@ -265,11 +283,11 @@ SI_SESSION_COLUMNS = [
     "mouse_name",
     "session_name",
     "depth_type",
-    "recording_type",
-    "analysis_file_path",
+    "modality",
+    "standardized_file_path",
     "row_index",
-    "embedding_type",
-    "embedding_dim",
+    "data_space",
+    "n_neurons",
     "n_timepoints_original",
     "n_timepoints_after_dir_filter",
     "n_timepoints_after_outlier_filter",
@@ -298,89 +316,98 @@ def append_csv_row(csv_path, columns, row):
 
 
 # =============================================================================
-# Main row processing
+# Row Processing
 # =============================================================================
 
 def process_row(row_idx, row):
-    analysis_file_path = row["analysis_file_path"]
+    # Support both column names: 'standardized_file_path' or legacy 'analysis_file_path'
+    raw_path = row.get("standardized_file_path", row.get("analysis_file_path", ""))
 
-    if not os.path.isfile(analysis_file_path):
-        raise FileNotFoundError(f"Missing analysis file: {analysis_file_path}")
+    # Fix corrupted columns where path shifted into 'contains_pos'
+    if str(raw_path).isdigit():
+        raw_path = row.get("contains_pos", raw_path)
 
-    payload = load_pickle_standard(analysis_file_path)
+    session_path = resolve_path(raw_path)
+    if not os.path.isfile(session_path):
+        raise FileNotFoundError(f"Standardized session file not found: {raw_path}")
 
-    if EMBEDDING_KEY not in payload:
-        raise KeyError(f"Missing embedding key '{EMBEDDING_KEY}' in {analysis_file_path}")
-    if "behavior" not in payload:
-        raise KeyError(f"Missing 'behavior' in {analysis_file_path}")
+    payload = load_pickle_standard(session_path)
 
-    data_space = ensure_2d(payload[EMBEDDING_KEY])
-    behavior = payload["behavior"]
+    # Signal matrix extraction (T x N)
+    if "signal" in payload:
+        raw_signal = np.asarray(payload["signal"])
+    elif "clean_traces" in payload:
+        raw_signal = np.asarray(payload["clean_traces"])
+    else:
+        raise KeyError(f"No signal matrix ('signal' or 'clean_traces') found in {session_path}")
 
-    pos = ensure_1d(behavior["pos"])
-    mov_dir = ensure_1d(behavior["mov_dir"])
-    time_1d = ensure_1d(behavior["time"])
+    # Extract behavior
+    n_time_candidate = raw_signal.shape[0]
+    beh_dict = extract_behavior_dict(payload, n_time_candidate)
 
-    speed = ensure_1d(behavior["speed"]) if behavior.get("speed", None) is not None else None
-    trial_id = ensure_1d(behavior["trial_id"]) if behavior.get("trial_id", None) is not None else None
-    inner_time = ensure_1d(behavior["inner_time"]) if behavior.get("inner_time", None) is not None else None
+    # Transpose check: ensure dimension 0 is time (T) matching behavioral length
+    time_len = len(beh_dict["time"])
+    if raw_signal.shape[0] != time_len and raw_signal.shape[1] == time_len:
+        raw_signal = raw_signal.T
 
-    beh_dict = {
-        "position": pos,
-        "speed": speed,
-        "time": time_1d,
-        "inner_time": inner_time,
-        "trial_id": trial_id,
-        "direction": mov_dir,
-    }
+    n_timepoints_original, n_neurons = raw_signal.shape
+    if n_timepoints_original != len(beh_dict["time"]):
+        raise ValueError(
+            f"Signal timepoints ({n_timepoints_original}) do not match behavior ({len(beh_dict['time'])})"
+        )
 
-    validate_lengths(data_space, beh_dict, row_idx)
+    # Signal conditioning
+    signal = raw_signal.copy()
+    if SMOOTH_SIGMA > 0:
+        signal = gaussian_filter1d(signal, sigma=SMOOTH_SIGMA, axis=0)
 
-    n_timepoints_original = data_space.shape[0]
-    embedding_dim = data_space.shape[1]
+    if Z_SCORE_NEURONS:
+        mu = np.nanmean(signal, axis=0, keepdims=True)
+        sd = np.nanstd(signal, axis=0, keepdims=True)
+        sd[sd == 0] = 1.0
+        signal = (signal - mu) / sd
 
     # -------------------------------------------------------------------------
-    # remove mov_dir == 0
+    # 1. Filter mov_dir == 0
     # -------------------------------------------------------------------------
-    valid_idx = mov_dir != 0
-    data_valid = data_space[valid_idx, :]
+    mov_dir = beh_dict["direction"]
+    valid_idx = (mov_dir != 0) & np.isfinite(mov_dir)
+    signal_valid = signal[valid_idx, :]
 
     beh_valid = {}
-    for key, val in beh_dict.items():
-        beh_valid[key] = None if val is None else val[valid_idx]
+    for k, v in beh_dict.items():
+        beh_valid[k] = None if v is None else v[valid_idx]
 
-    n_timepoints_after_dir_filter = data_valid.shape[0]
-    if n_timepoints_after_dir_filter < 10:
-        raise ValueError(f"Row {row_idx}: too few timepoints after mov_dir != 0 filtering")
+    n_timepoints_after_dir_filter = signal_valid.shape[0]
+    if n_timepoints_after_dir_filter < 20:
+        raise ValueError(
+            f"Row {row_idx}: too few points after mov_dir != 0 filtering ({n_timepoints_after_dir_filter})")
 
     # -------------------------------------------------------------------------
-    # outlier filtering in embedding space
+    # 2. Density outlier filtering in Complete Neural Space
     # -------------------------------------------------------------------------
-    D = pairwise_distances(data_valid)
+    D = pairwise_distances(signal_valid)
     noise_idx, signal_idx = filter_noisy_outliers(
-        data_valid,
+        signal_valid,
         D=D,
         dist_th=OUTLIER_DIST_TH,
         noise_th=OUTLIER_NOISE_TH,
     )
+    del D
 
-    data_clean = data_valid[signal_idx, :]
-
+    signal_clean = signal_valid[signal_idx, :]
     beh_clean = {}
-    for key, val in beh_valid.items():
-        beh_clean[key] = None if val is None else val[signal_idx]
+    for k, v in beh_valid.items():
+        beh_clean[k] = None if v is None else v[signal_idx]
 
-    n_timepoints_after_outlier_filter = data_clean.shape[0]
-    if n_timepoints_after_outlier_filter < 10:
-        raise ValueError(f"Row {row_idx}: too few timepoints after outlier filtering")
+    n_timepoints_after_outlier_filter = signal_clean.shape[0]
+    if n_timepoints_after_outlier_filter < 20:
+        raise ValueError(f"Row {row_idx}: too few points after outlier filtering ({n_timepoints_after_outlier_filter})")
 
-    position_direction = np.concatenate(
-        (
-            beh_clean["position"].reshape(-1, 1),
-            beh_clean["direction"].reshape(-1, 1),
-        ),
-        axis=1,
-    )
+    # Construct joint (position, direction) label
+    pos_clean = beh_clean["position"].reshape(-1, 1)
+    dir_clean = beh_clean["direction"].reshape(-1, 1)
+    position_direction = np.concatenate([pos_clean, dir_clean], axis=1)
 
     behaviors_for_si = {
         "position": beh_clean["position"],
@@ -392,51 +419,57 @@ def process_row(row_idx, row):
         "position_direction": position_direction,
     }
 
+    # -------------------------------------------------------------------------
+    # 3. Compute Structure Index in Complete Neural Space
+    # -------------------------------------------------------------------------
     si_results = {}
     si_details = {}
 
     for beh_name in SI_BEHAVIOR_ORDER:
         beh_val = behaviors_for_si[beh_name]
 
-        if beh_val is None:
+        if beh_val is None or not np.isfinite(beh_val).any():
             si_results[beh_name] = np.nan
             si_details[beh_name] = None
             continue
 
         params = get_si_params_for_behavior(beh_name, beh_val)
 
-        si, process_info, overlap_mat, shuf_si = compute_structure_index(
-            data_clean,
-            beh_val,
-            **params,
-        )
+        try:
+            si, process_info, overlap_mat, shuf_si = compute_structure_index(
+                signal_clean,
+                beh_val,
+                **params,
+            )
+            si_results[beh_name] = float(si)
+            si_details[beh_name] = {
+                "si": float(si),
+                "process_info": copy.deepcopy(process_info),
+                "overlap_mat": copy.deepcopy(overlap_mat),
+                "shuf_si": copy.deepcopy(shuf_si),
+                "params": copy.deepcopy(params),
+            }
+        except Exception as exc:
+            print(f"    [SI WARN] {beh_name} failed: {exc}")
+            si_results[beh_name] = np.nan
+            si_details[beh_name] = None
 
-        si_results[beh_name] = si
-        si_details[beh_name] = {
-            "si": copy.deepcopy(si),
-            "process_info": copy.deepcopy(process_info),
-            "overlap_mat": copy.deepcopy(overlap_mat),
-            "shuf_si": copy.deepcopy(shuf_si),
-            "params": copy.deepcopy(params),
-        }
-
-    recording_type = infer_recording_type(row)
-
-    session_base = base_name_from_row(row_idx, row) + f"_si_{EMBEDDING_KEY}"
+    # Save session details
+    session_base = base_name_from_row(row_idx, row) + "_si_neural_space"
     session_pickle_name = session_base + ".pkl"
     session_pickle_path = os.path.join(SESSION_PKL_DIR, session_pickle_name)
 
     session_payload = {
         "metadata": {
-            "dataset_name": row["dataset_name"],
-            "mouse_name": row["mouse_name"],
-            "session_name": row["session_name"],
-            "depth_type": row["depth_type"],
-            "recording_type": recording_type,
+            "dataset_name": row.get("dataset_name", ""),
+            "mouse_name": row.get("mouse_name", ""),
+            "session_name": row.get("session_name", ""),
+            "depth_type": row.get("depth_type", ""),
+            "modality": row.get("modality", "calcium_imaging"),
             "row_index": row_idx,
-            "analysis_file_path": analysis_file_path,
-            "embedding_type": EMBEDDING_KEY,
-            "embedding_dim": embedding_dim,
+            "standardized_file_path": session_path,
+            "data_space": "complete_neural_space",
+            "n_neurons": n_neurons,
             "n_timepoints_original": n_timepoints_original,
             "n_timepoints_after_dir_filter": n_timepoints_after_dir_filter,
             "n_timepoints_after_outlier_filter": n_timepoints_after_outlier_filter,
@@ -454,15 +487,15 @@ def process_row(row_idx, row):
     save_pickle_standard(session_pickle_path, session_payload)
 
     session_row = {
-        "dataset_name": row["dataset_name"],
-        "mouse_name": row["mouse_name"],
-        "session_name": row["session_name"],
-        "depth_type": row["depth_type"],
-        "recording_type": recording_type,
-        "analysis_file_path": analysis_file_path,
+        "dataset_name": row.get("dataset_name", ""),
+        "mouse_name": row.get("mouse_name", ""),
+        "session_name": row.get("session_name", ""),
+        "depth_type": row.get("depth_type", ""),
+        "modality": row.get("modality", "calcium_imaging"),
+        "standardized_file_path": session_path,
         "row_index": row_idx,
-        "embedding_type": EMBEDDING_KEY,
-        "embedding_dim": embedding_dim,
+        "data_space": "complete_neural_space",
+        "n_neurons": n_neurons,
         "n_timepoints_original": n_timepoints_original,
         "n_timepoints_after_dir_filter": n_timepoints_after_dir_filter,
         "n_timepoints_after_outlier_filter": n_timepoints_after_outlier_filter,
@@ -477,24 +510,23 @@ def process_row(row_idx, row):
         "session_pickle_path": session_pickle_path,
     }
 
+    def fmt(v):
+        return f"{v:.4f}" if np.isfinite(v) else "NaN"
+
     print(
-        f"Row {row_idx} | dataset={row['dataset_name']} | mouse={row['mouse_name']} | "
-        f"session={row['session_name']} | depth={row['depth_type']} | "
-        f"emb={EMBEDDING_KEY} | "
-        f"SI pos={session_row['si_position']:.4f} | "
-        f"speed={session_row['si_speed']:.4f} | "
-        f"time={session_row['si_time']:.4f} | "
-        f"inner_time={session_row['si_inner_time']:.4f} | "
-        f"trial_id={session_row['si_trial_id']:.4f} | "
-        f"dir={session_row['si_direction']:.4f} | "
-        f"(pos,dir)={session_row['si_position_direction']:.4f}"
+        f"Row {row_idx:03d} | {row.get('dataset_name')} | {row.get('mouse_name')} | "
+        f"{row.get('session_name')} | {row.get('depth_type')} | N={n_neurons} | "
+        f"SI pos={fmt(session_row['si_position'])} | "
+        f"dir={fmt(session_row['si_direction'])} | "
+        f"time={fmt(session_row['si_time'])} | "
+        f"(pos,dir)={fmt(session_row['si_position_direction'])}"
     )
 
     return session_row
 
 
 # =============================================================================
-# Main
+# Main Loop
 # =============================================================================
 
 def main():
@@ -502,59 +534,61 @@ def main():
     ensure_dir(SESSION_PKL_DIR)
     ensure_dir(LOG_DIR)
 
-    if not os.path.isfile(ANALYSIS_INDEX_CSV):
-        raise FileNotFoundError(f"Analysis index CSV not found: {ANALYSIS_INDEX_CSV}")
+    if not os.path.isfile(MASTER_INDEX_CSV):
+        raise FileNotFoundError(f"Master metadata CSV not found: {MASTER_INDEX_CSV}")
 
-    df = pd.read_csv(ANALYSIS_INDEX_CSV)
-    df = df[df["dataset_name"] == "dreadds"].copy()
+    df = pd.read_csv(MASTER_INDEX_CSV)
+
+    # Optional filter by dataset
+    if DATASET_FILTER is not None:
+        # Match 'dreadds' or case variations
+        df = df[df["dataset_name"].astype(str).str.lower() == DATASET_FILTER.lower()].copy()
+
     df = df.reset_index(drop=True)
     if MAX_ROWS is not None:
         df = df.iloc[:MAX_ROWS].copy()
 
     init_csv(SI_SESSION_CSV, SI_SESSION_COLUMNS)
 
-    log_path = os.path.join(LOG_DIR, "structure_index_umap_log.txt")
+    log_path = os.path.join(LOG_DIR, "structure_index_neural_space_log.txt")
     log_file = open(log_path, "w", encoding="utf-8")
     original_stdout = os.sys.stdout
     os.sys.stdout = Tee(original_stdout, log_file)
 
     print("==============================================================")
-    print("Structure Index analysis pipeline in embedding space")
+    print("Structure Index analysis in COMPLETE NEURAL SPACE")
     print(f"Started: {datetime.now():%Y-%m-%d %H:%M}")
     print("==============================================================")
-    print(f"Input CSV: {ANALYSIS_INDEX_CSV}")
-    print(f"Embedding used: {EMBEDDING_KEY}")
-    print(f"Rows to process: {len(df)}")
-    print(f"Output dir: {OUTPUT_DIR}")
-    print(f"Session CSV: {SI_SESSION_CSV}")
-    print(f"Session PKL dir: {SESSION_PKL_DIR}")
-    print("")
+    print(f"Metadata CSV: {MASTER_INDEX_CSV}")
+    print(f"Dataset filter: {DATASET_FILTER}")
+    print(f"Total sessions: {len(df)}")
+    print(f"Output table: {SI_SESSION_CSV}")
+    print(f"Pickles dir:  {SESSION_PKL_DIR}")
+    print("==============================================================\n")
 
     ok_count = 0
     fail_count = 0
     global_time = timeit.default_timer()
 
     for row_idx, row in df.iterrows():
-        local_time = timeit.default_timer()
+        t0 = timeit.default_timer()
         try:
             session_row = process_row(row_idx, row)
             append_csv_row(SI_SESSION_CSV, SI_SESSION_COLUMNS, session_row)
             ok_count += 1
-
-            elapsed = timeit.default_timer() - local_time
-            print(f"[OK] Row {row_idx} finished in {elapsed:.2f} s\n")
-
+            elapsed = timeit.default_timer() - t0
+            print(f"[OK] Completed in {elapsed:.2f} s\n")
         except Exception as e:
             fail_count += 1
             print(f"[ERROR] Row {row_idx}: {e}\n")
 
     total_elapsed = timeit.default_timer() - global_time
     print("==============================================================")
-    print("Done")
-    print(f"Finished: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"Successful entries: {ok_count}")
-    print(f"Failed entries: {fail_count}")
-    print(f"Total elapsed time: {total_elapsed:.2f} s")
+    print("Execution Finished")
+    print(f"End time: {datetime.now():%Y-%m-%d %H:%M}")
+    print(f"Successful: {ok_count}")
+    print(f"Failed:     {fail_count}")
+    print(f"Total time: {total_elapsed:.2f} s")
     print("==============================================================")
 
     os.sys.stdout = original_stdout
@@ -563,9 +597,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-########################################################################
-######################## PLOTTING RESULTS ###################################
-########################################################################
-

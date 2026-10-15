@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+import argparse
 import csv
+import os
 import pickle
 import numpy as np
 import pandas as pd
@@ -15,8 +16,8 @@ import umap
 # Paths
 # =============================================================================
 
-CSV_PATH = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/umap_pca_per_row"
+CSV_PATH = "/home/hippolab/Documents/melisa/time_project_standarization/data/metadata/master_dataset_index.csv"
+OUTPUT_DIR = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/umap_pca_per_row"
 
 PNG_DIR = os.path.join(OUTPUT_DIR, "png")
 SVG_DIR = os.path.join(OUTPUT_DIR, "svg")
@@ -141,11 +142,11 @@ def get_direction_colors():
 
 
 def compute_position_direction_plane_normal(
-        embedding,
-        pos_1d,
-        mov_dir,
-        n_pos_bins=30,
-        min_count_per_bin=5
+    embedding,
+    pos_1d,
+    mov_dir,
+    n_pos_bins=30,
+    min_count_per_bin=5
 ):
     """
     Estimate a plane from position bins computed separately for mov_dir = -1 and +1.
@@ -226,15 +227,15 @@ def normal_to_view_angles(normal, tilt_deg=30.0):
 
 
 def plot_embedding_triplet(
-        embedding,
-        pos_1d,
-        mov_dir,
-        time_1d,
-        method_name,
-        row_idx,
-        row,
-        elev=None,
-        azim=None
+    embedding,
+    pos_1d,
+    mov_dir,
+    time_1d,
+    method_name,
+    row_idx,
+    row,
+    elev=None,
+    azim=None
 ):
     fig = plt.figure(figsize=(18, 6))
 
@@ -492,10 +493,72 @@ def process_row(row_idx, row):
 
 
 # =============================================================================
-# Main
+# Main & Filtering Logic
 # =============================================================================
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute UMAP and PCA embeddings with behavior alignment."
+    )
+    parser.add_argument(
+        "--dataset",
+        "-d",
+        type=str,
+        default=None,
+        help="Dataset name (e.g. 'intervention', 'learning').",
+    )
+    parser.add_argument(
+        "--animal",
+        "--mouse",
+        "-m",
+        type=str,
+        default=None,
+        help="Animal/Mouse name (e.g. '032' or 'M032'). Partial matches supported.",
+    )
+    parser.add_argument(
+        "--session",
+        "-s",
+        type=str,
+        default=None,
+        help="Session name (e.g. 'basal', '1707', 'S1'). Partial matches supported.",
+    )
+    return parser.parse_args()
+
+
+def filter_dataframe(df, dataset=None, animal=None, session=None):
+    filtered = df.copy()
+
+    if dataset is not None:
+        dataset_str = str(dataset).strip()
+        mask = filtered["dataset_name"].astype(str) == dataset_str
+        if not mask.any():
+            print(f"[ERROR] Dataset '{dataset_str}' not found.")
+            print(f"Available datasets: {list(df['dataset_name'].unique())}")
+            return pd.DataFrame()
+        filtered = filtered[mask]
+
+    if animal is not None:
+        animal_str = str(animal).strip()
+        mask = filtered["mouse_name"].astype(str).str.contains(animal_str, case=False, na=False)
+        if not mask.any():
+            print(f"[ERROR] Animal matching '{animal_str}' not found.")
+            print(f"Available animals: {list(filtered['mouse_name'].unique())}")
+            return pd.DataFrame()
+        filtered = filtered[mask]
+
+    if session is not None:
+        session_str = str(session).strip()
+        mask = filtered["session_name"].astype(str).str.contains(session_str, case=False, na=False)
+        if not mask.any():
+            print(f"[ERROR] Session matching '{session_str}' not found.")
+            print(f"Available sessions: {list(filtered['session_name'].unique())}")
+            return pd.DataFrame()
+        filtered = filtered[mask]
+
+    return filtered.reset_index(drop=True)
+
+
+def main(dataset=None, animal=None, session=None):
     ensure_dir(OUTPUT_DIR)
     ensure_dir(PNG_DIR)
     ensure_dir(SVG_DIR)
@@ -506,24 +569,34 @@ def main():
 
     df = pd.read_csv(CSV_PATH)
 
-    # Keep only lt_ephys dataset
-    #df = df[df["dataset_name"] == "learning"].copy()
-    #df = df.reset_index(drop=True)
+    is_filtered_run = any(arg is not None for arg in (dataset, animal, session))
 
-    print(f"Loaded CSV with {len(df)} learning rows")
-    print(f"Saving PNG to: {PNG_DIR}")
-    print(f"Saving SVG to: {SVG_DIR}")
+    # Apply filters
+    if is_filtered_run:
+        df = filter_dataframe(df, dataset=dataset, animal=animal, session=session)
+        if df.empty:
+            print("[ABORT] No matching rows found.")
+            return
+        print(f"\n[INFO] Running for {len(df)} matching row(s):")
+        for idx, r in df[["dataset_name", "mouse_name", "session_name"]].iterrows():
+            print(f"  [{idx}] {r['dataset_name']} | {r['mouse_name']} | {r['session_name']}")
+    else:
+        print(f"Running across complete database ({len(df)} rows)")
 
     if MAX_ROWS is not None:
         df = df.iloc[:MAX_ROWS].copy()
 
-    init_analysis_index_csv(ANALYSIS_INDEX_CSV)
+    # Manage analysis index CSV: overwrite if complete run; preserve & append if filtered run
+    if not is_filtered_run:
+        init_analysis_index_csv(ANALYSIS_INDEX_CSV)
+    else:
+        if not os.path.isfile(ANALYSIS_INDEX_CSV):
+            init_analysis_index_csv(ANALYSIS_INDEX_CSV)
 
-    print(f"Loaded CSV with {len(df)} rows")
-    print(f"Saving PNG to: {PNG_DIR}")
+    print(f"\nSaving PNG to: {PNG_DIR}")
     print(f"Saving SVG to: {SVG_DIR}")
     print(f"Saving embedding files to: {EMBEDDING_DATA_DIR}")
-    print(f"Saving analysis index CSV to: {ANALYSIS_INDEX_CSV}")
+    print(f"Saving analysis index CSV to: {ANALYSIS_INDEX_CSV}\n")
 
     ok_count = 0
     fail_count = 0
@@ -546,4 +619,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(dataset=args.dataset, animal=args.animal, session=args.session)

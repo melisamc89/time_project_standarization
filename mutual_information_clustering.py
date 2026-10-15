@@ -12,9 +12,9 @@ This version:
 4) Row-wise z-score across the 7 MIR behaviors
 5) StandardScaler across cells
 6) KMeans on training
-7) Uses 75% centroid-distance filtering ONLY during training
+7) Uses 75% centroid-distance thresholds for training; independently configurable percentile during transfer
 8) Fits openTSNE on training
-9) Transfers to other datasets using ALL cells (no 75% exclusion on transfer)
+9) Transfers ALL cells; distant neurons are labeled 10 (Unassigned)
 10) Saves neuron-level CSVs with original MI info + cluster_id + tsne coords + neuron_uid
 11) Adds statistics .txt files for every barplot
 12) For behavior × cluster plots, runs two-way ANOVA + pairwise Welch t-tests
@@ -43,15 +43,14 @@ from openTSNE import TSNE
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
 
-
 # =============================================================================
 # Paths
 # =============================================================================
 
-MI_CSV = "/home/melisamc/Documents/time_project_standarization/analysis/mutual_information/mutual_information_per_neuron.csv"
-MASTER_INDEX_CSV = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
+MI_CSV = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/mutual_information/mutual_information_per_neuron.csv"
+MASTER_INDEX_CSV = "/home/hippolab/Documents/melisa/time_project_standarization/data/metadata/master_dataset_index.csv"
 
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/mir_training_and_transfer"
+OUTPUT_DIR = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/mir_training_and_transfer"
 TRAIN_DIR = os.path.join(OUTPUT_DIR, "training")
 TRANSFER_DIR = os.path.join(OUTPUT_DIR, "transfer")
 
@@ -60,7 +59,6 @@ TRAIN_DATA_DIR = os.path.join(TRAIN_DIR, "data")
 TRAIN_PNG_DIR = os.path.join(TRAIN_DIR, "png")
 TRAIN_SVG_DIR = os.path.join(TRAIN_DIR, "svg")
 TRAIN_STATS_DIR = os.path.join(TRAIN_DIR, "stats")
-
 
 # =============================================================================
 # Parameters
@@ -100,7 +98,12 @@ N_CLUSTERS = 3
 UNASSIGNED_LABEL = 10
 KMEANS_RANDOM_STATE = 42
 KMEANS_N_INIT = 50
-KEEP_PERCENTILE = 75
+TRAIN_KEEP_PERCENTILE = 75
+# Transfer cutoff is a percentile of the LEARNING cluster-distance distribution.
+# 75 reproduces the training cutoff; 90 is more permissive; 50 is stricter.
+TRANSFER_KEEP_PERCENTILE = 90
+# Optional per-dataset override in TRANSFER_CONFIGS:
+#   "transfer_keep_percentile": 90,
 
 TSNE_PERPLEXITY = 50
 TSNE_RANDOM_STATE = 42
@@ -119,10 +122,10 @@ MIR_VMAX_Z = 3.5
 
 # cluster colors from previous code
 CLUSTER_COLOR_MAP = {
-    2: "#ec8ef8ff",    # Position
-    1: "#66cef4ff",    # Direction
-    0: "#bce784ff",    # Time
-    10: "#bbbcc0ff",   # Unassigned
+    2: "#ec8ef8ff",  # Position
+    1: "#66cef4ff",  # Direction
+    0: "#bce784ff",  # Time
+    10: "#bbbcc0ff",  # Unassigned
 }
 
 CLUSTER_COLOR_MAP_STR = {
@@ -290,7 +293,7 @@ def select_latest_session_per_mouse(df):
 
     keep_sessions = session_table[
         session_table["session_datetime"] == session_table["latest_datetime"]
-    ][["mouse_name", "session_name"]].drop_duplicates()
+        ][["mouse_name", "session_name"]].drop_duplicates()
 
     out = df.merge(keep_sessions, on=["mouse_name", "session_name"], how="inner")
     return out
@@ -299,12 +302,12 @@ def select_latest_session_per_mouse(df):
 def add_neuron_uid(df):
     out = df.copy()
     out["neuron_uid"] = (
-        out["dataset_name"].astype(str) + "__" +
-        out["mouse_name"].astype(str) + "__" +
-        out["session_name"].astype(str) + "__" +
-        out["depth_type"].astype(str) + "__row" +
-        out["row_index"].astype(str) + "__neuron" +
-        out["neuron_index"].astype(str)
+            out["dataset_name"].astype(str) + "__" +
+            out["mouse_name"].astype(str) + "__" +
+            out["session_name"].astype(str) + "__" +
+            out["depth_type"].astype(str) + "__row" +
+            out["row_index"].astype(str) + "__neuron" +
+            out["neuron_index"].astype(str)
     )
     return out
 
@@ -390,7 +393,7 @@ def run_cluster_count_gof_test(counts_df, cluster_col="cluster_str", count_col="
         txt.append(f"Observed clusters: {labels}\n")
         txt.append(f"Observed counts: {observed.tolist()}\n")
         txt.append(f"Expected equal counts: {expected.tolist()}\n")
-        txt.append(f"chi2={chi2:.6f}, p={pval:.6e}, dof={len(observed)-1}\n")
+        txt.append(f"chi2={chi2:.6f}, p={pval:.6e}, dof={len(observed) - 1}\n")
     except Exception as e:
         txt.append(f"Test failed: {e}\n")
 
@@ -487,9 +490,9 @@ def run_two_way_anova_and_pairs(df, factor_a, factor_b, value_col, title):
     levels_b = sorted(df[factor_b].dropna().astype(str).unique().tolist())
 
     enough_for_anova = (
-        len(levels_a) >= 2 and
-        len(levels_b) >= 2 and
-        len(df) > (len(levels_a) * len(levels_b))
+            len(levels_a) >= 2 and
+            len(levels_b) >= 2 and
+            len(df) > (len(levels_a) * len(levels_b))
     )
 
     if enough_for_anova:
@@ -574,17 +577,20 @@ def fit_training_models(df_train):
 
     keep_labels = np.full(len(X_scaled), UNASSIGNED_LABEL, dtype=int)
     thresholds = {}
+    cluster_training_distances = {}
 
     for cid in range(N_CLUSTERS):
         cluster_indices = np.where(initial_labels == cid)[0]
         if len(cluster_indices) == 0:
             thresholds[cid] = np.nan
+            cluster_training_distances[cid] = np.array([], dtype=float)
             continue
 
         cluster_points = X_scaled[cluster_indices]
         centroid = centroids[cid]
         dists = np.linalg.norm(cluster_points - centroid, axis=1)
-        threshold = np.percentile(dists, KEEP_PERCENTILE)
+        cluster_training_distances[cid] = dists.copy()
+        threshold = np.percentile(dists, TRAIN_KEEP_PERCENTILE)
         thresholds[cid] = float(threshold)
 
         keep_mask = dists <= threshold
@@ -618,11 +624,13 @@ def fit_training_models(df_train):
         "kmeans": kmeans,
         "tsne_embedding_model": tsne_embedding,
         "thresholds_raw_cluster": thresholds,
+        "training_distances_raw_cluster": cluster_training_distances,
         "cluster_remap_raw_to_semantic": remap_dict,
         "feature_columns": MIR_FEATURE_COLUMNS,
         "z_feature_columns": z_cols,
         "n_clusters": N_CLUSTERS,
-        "keep_percentile": KEEP_PERCENTILE,
+        "keep_percentile": TRAIN_KEEP_PERCENTILE,
+        "transfer_keep_percentile_default": TRANSFER_KEEP_PERCENTILE,
         "unassigned_label": UNASSIGNED_LABEL,
         "centroids_raw": centroids,
     }
@@ -673,44 +681,68 @@ def infer_cluster_semantic_mapping(df_train, raw_keep_labels):
     return remap
 
 
-def apply_trained_model(df_target, model_package):
+def apply_trained_model(df_target, model_package, transfer_keep_percentile=TRANSFER_KEEP_PERCENTILE):
+    """Transfer clusters and mark neurons beyond a configurable learning-derived cutoff.
+
+    The percentile refers to the TRAINING cluster's assigned-neuron distance
+    distribution, not the transferred population. All target neurons are kept.
     """
-    Transfer version: ALL cells included, no 75% exclusion.
-    """
+    if not (0 <= transfer_keep_percentile <= 100):
+        raise ValueError("transfer_keep_percentile must be between 0 and 100")
+
     scaler = model_package["scaler"]
     kmeans = model_package["kmeans"]
     tsne_embedding_model = model_package["tsne_embedding_model"]
     remap_dict = model_package["cluster_remap_raw_to_semantic"]
+    train_distances = model_package["training_distances_raw_cluster"]
 
     X_raw = df_target[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
-
     valid_mask = np.all(np.isfinite(X_raw), axis=1)
     df_target = df_target.loc[valid_mask].copy().reset_index(drop=True)
     X_raw = X_raw[valid_mask]
-
     if len(df_target) == 0:
         raise ValueError("All target rows were removed due to invalid MIR values.")
 
     X_z = rowwise_zscore(X_raw)
-    z_cols = [f"z_{c}" for c in MIR_FEATURE_COLUMNS]
-    for j, col in enumerate(z_cols):
+    for j, col in enumerate([f"z_{c}" for c in MIR_FEATURE_COLUMNS]):
         df_target[col] = X_z[:, j]
 
     X_scaled = scaler.transform(X_z)
-
     raw_pred = kmeans.predict(X_scaled)
-    final_semantic = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in raw_pred], dtype=int)
+    predicted_semantic = np.array(
+        [remap_dict.get(int(c), UNASSIGNED_LABEL) for c in raw_pred], dtype=int
+    )
+    centroid_distances = np.linalg.norm(
+        X_scaled - kmeans.cluster_centers_[raw_pred], axis=1
+    )
+    # Thresholds are computed from the learning data for the chosen percentile.
+    cutoff_by_cluster = {
+        cid: (float(np.percentile(distances, transfer_keep_percentile))
+              if len(distances) else np.nan)
+        for cid, distances in train_distances.items()
+    }
+    cutoffs = np.array([cutoff_by_cluster[int(c)] for c in raw_pred])
+    within_threshold = np.isfinite(cutoffs) & (centroid_distances <= cutoffs)
+    final_labels = np.where(within_threshold, predicted_semantic, UNASSIGNED_LABEL).astype(int)
 
-    transformed = tsne_embedding_model.transform(X_scaled)
-    emb_np = np.asarray(transformed)
-
+    embedding = np.asarray(tsne_embedding_model.transform(X_scaled))
     df_target["cluster_initial"] = raw_pred
-    df_target["cluster_pred_semantic"] = final_semantic
-    df_target["cluster_id"] = final_semantic
-    df_target["tsne_1"] = emb_np[:, 0]
-    df_target["tsne_2"] = emb_np[:, 1]
+    df_target["cluster_pred_semantic"] = predicted_semantic
+    df_target["cluster_id"] = final_labels
+    df_target["centroid_distance"] = centroid_distances
+    df_target["centroid_distance_threshold"] = cutoffs
+    df_target["transfer_keep_percentile"] = transfer_keep_percentile
+    df_target["within_transfer_threshold"] = within_threshold
+    df_target["tsne_1"] = embedding[:, 0]
+    df_target["tsne_2"] = embedding[:, 1]
 
-    return df_target, X_raw, X_z, X_scaled, emb_np
+    print(
+        f"  Transfer cutoff P{transfer_keep_percentile:g}: "
+        f"{within_threshold.sum()}/{len(within_threshold)} assigned; "
+        f"{(~within_threshold).sum()} unassigned "
+        f"({100 * (~within_threshold).mean():.1f}%)."
+    )
+    return df_target, X_raw, X_z, X_scaled, embedding
 
 
 # =============================================================================
@@ -825,7 +857,7 @@ def plot_embedding_grid(df_plot, out_png_dir, out_svg_dir, out_base, use_z=True,
     plt.tight_layout()
     save_figure_both(fig, out_png_dir, out_svg_dir, out_base)
 
-    if add_depth:
+    if add_depth:  # Always passed True for t-SNE plots below
         fig, ax = plt.subplots(figsize=(5, 4.5))
         plot_df = df_plot.copy()
         plot_df["depth_norm"] = plot_df["depth_type"].apply(normalize_depth_label)
@@ -1106,9 +1138,9 @@ def main():
     df_master = pd.read_csv(MASTER_INDEX_CSV)
 
     required_cols = [
-        "dataset_name", "mouse_name", "session_name", "depth_type",
-        "recording_type", "row_index", "neuron_index"
-    ] + MIR_FEATURE_COLUMNS
+                        "dataset_name", "mouse_name", "session_name", "depth_type",
+                        "recording_type", "row_index", "neuron_index"
+                    ] + MIR_FEATURE_COLUMNS
     missing = [c for c in required_cols if c not in df_mi.columns]
     if missing:
         raise ValueError(f"Missing required columns in MI CSV: {missing}")
@@ -1164,7 +1196,8 @@ def main():
         "mir_feature_columns": MIR_FEATURE_COLUMNS,
         "n_clusters": N_CLUSTERS,
         "unassigned_label": UNASSIGNED_LABEL,
-        "keep_percentile": KEEP_PERCENTILE,
+        "keep_percentile": TRAIN_KEEP_PERCENTILE,
+        "transfer_keep_percentile_default": TRANSFER_KEEP_PERCENTILE,
         "cluster_colors": CLUSTER_COLOR_MAP,
         "cluster_names": CLUSTER_NAME_MAP,
         "cluster_remap_raw_to_semantic": model_package["cluster_remap_raw_to_semantic"],
@@ -1261,7 +1294,10 @@ def main():
             continue
 
         try:
-            df_applied, Xr, Xz, Xs, emb = apply_trained_model(df_subset, model_package)
+            df_applied, Xr, Xz, Xs, emb = apply_trained_model(
+                df_subset, model_package,
+                transfer_keep_percentile=cfg.get("transfer_keep_percentile", TRANSFER_KEEP_PERCENTILE),
+            )
         except Exception as e:
             print(f"[WARNING] Failed on subset {name}: {e}")
             continue
@@ -1285,7 +1321,7 @@ def main():
             subset_svg_dir,
             f"{sanitize_for_filename(name)}_clusters_grid",
             use_z=True,
-            add_depth=add_depth
+            add_depth=True
         )
         plot_cluster_counts(
             df_applied,
@@ -1337,6 +1373,11 @@ def main():
             "mice": sorted(df_applied["mouse_name"].dropna().astype(str).unique().tolist()),
             "sessions": sorted(df_applied["session_name"].dropna().astype(str).unique().tolist()),
             "depths": sorted(df_applied["depth_type"].dropna().astype(str).unique().tolist()),
+            "distance_filter": "learning_derived_percentile_per_kmeans_cluster",
+            "training_keep_percentile": TRAIN_KEEP_PERCENTILE,
+            "transfer_keep_percentile": cfg.get("transfer_keep_percentile", TRANSFER_KEEP_PERCENTILE),
+            "n_assigned": int(df_applied["within_transfer_threshold"].sum()),
+            "n_unassigned": int((~df_applied["within_transfer_threshold"]).sum()),
         }
         with open(os.path.join(subset_out_dir, "subset_metadata.json"), "w", encoding="utf-8") as f:
             json.dump(subset_meta, f, indent=2)

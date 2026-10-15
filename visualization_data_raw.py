@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import os
 import pickle
 import numpy as np
@@ -12,8 +13,8 @@ import matplotlib.pyplot as plt
 # Paths
 # =============================================================================
 
-CSV_PATH = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/basic_timeseries_test_split"
+CSV_PATH = "/home/hippolab/Documents/melisa/time_project_standarization/data/metadata/master_dataset_index_2.csv"
+OUTPUT_DIR = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/basic_timeseries_test_split"
 
 PNG_DIR = os.path.join(OUTPUT_DIR, "png")
 SVG_DIR = os.path.join(OUTPUT_DIR, "svg")
@@ -341,7 +342,21 @@ def plot_one_entry(row_idx, row):
 # Main
 # =============================================================================
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate behavior, trace, and raster figures for neural recordings."
+    )
+    parser.add_argument(
+        "--dataset",
+        "-d",
+        type=str,
+        default=None,
+        help="Name of the dataset to run (e.g. 'lt_ephys_mice'). If omitted, runs the complete database.",
+    )
+    return parser.parse_args()
+
+
+def main(dataset_name=None):
     ensure_dir(OUTPUT_DIR)
     ensure_dir(PNG_DIR)
     ensure_dir(SVG_DIR)
@@ -351,11 +366,20 @@ def main():
 
     df = pd.read_csv(CSV_PATH)
 
-    # Keep only lt_ephys dataset
-    df = df[df["dataset_name"] == "lt_ephys_mice"].copy()
+    # Filter if dataset specified; otherwise run the full database
+    if dataset_name is not None:
+        available_datasets = df["dataset_name"].unique()
+        if dataset_name not in available_datasets:
+            print(f"[ERROR] Dataset '{dataset_name}' not found.")
+            print(f"Available datasets: {list(available_datasets)}")
+            return
+        df = df[df["dataset_name"] == dataset_name].copy()
+        print(f"Filtering to dataset: '{dataset_name}' ({len(df)} rows)")
+    else:
+        print(f"Running across complete database ({len(df)} rows)")
+
     df = df.reset_index(drop=True)
 
-    print(f"Loaded CSV with {len(df)} lt_ephys_mice rows")
     print(f"Saving PNG to: {PNG_DIR}")
     print(f"Saving SVG to: {SVG_DIR}")
     print(f"Neuron order mode: {NEURON_ORDER_MODE}")
@@ -381,4 +405,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(dataset_name=args.dataset)
