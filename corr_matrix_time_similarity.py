@@ -2,36 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Correlation-matrix drift analysis across all datasets.
+Comprehensive Multi-Method Neural Drift Analysis Pipeline:
+1. Correlation-Matrix Drift
+2. Element-by-Element Timepoint PV Correlation Drift
+3. Representational Similarity Analysis (RSA) Drift
+4. Procrustes Distance / Manifold Shape Matching Drift
 
-For each row/session:
-    1. Load standardized signal: time x neurons
-    2. Optionally remove mov_dir == 0
-    3. Z-score neurons across the full valid session
-    4. Split global time into N_CHUNKS
-    5. For each chunk:
-           compute neuron x neuron correlation matrix
-    6. For each pair of chunks:
-           vectorize upper triangle of both matrices
-           compute similarity between correlation matrices
-    7. Summarize similarity matrix by |Δ chunk|
-
-This is a second-order representation analysis:
-    chunk -> neuron-neuron correlation matrix
-
-Outputs:
-    /home/melisamc/Documents/time_project_standarization/CorrMatrix_Drift_Analysis
-
-Plots:
-    - per-row heatmaps
-    - learning session-wise mean matrices and lag curves
-    - lt_rot split into lt and rot, deep vs superficial
-    - dreads/dreadds/egrin deep vs superficial
-    - all non-learning deep/superficial comparisons
-
-Important:
-    lag 0 is saved in CSVs but excluded from summary plots.
-    y-axis limits are computed automatically from plotted values.
+Includes:
+- Automated path remapping & strict session-name condition parsing (fixing lt vs rot separation).
+- Intervention parameter evaluation (excluding 'combined', grouping by int_i/int_f values).
+- Separated Lag Bar Plots (with individual animal points) and Regression Line Plots.
+- Parameter Bar Comparisons with 2-way ANOVA, Tukey HSD Post-Hoc, and safe Significance Brackets (*, **, ***).
 """
 
 import os
@@ -40,39 +21,41 @@ import re
 import pickle
 import timeit
 from datetime import datetime
+import warnings
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import linregress, ttest_ind, mannwhitneyu
+from scipy.spatial import procrustes
+from sklearn.decomposition import PCA
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =============================================================================
-# PATHS
+# PATHS & CONFIGURATION
 # =============================================================================
 
 CSV_PATH = (
-    "/home/melisamc/Documents/time_project_standarization/"
+    "/home/hippolab/Documents/melisa/time_project_standarization/"
     "data/metadata/master_dataset_index.csv"
 )
 
 OUTPUT_DIR = (
-    "/home/melisamc/Documents/time_project_standarization/"
-    "CorrMatrix_Drift_Analysis"
+    "/home/hippolab/Documents/melisa/time_project_standarization/analysis/"
+    "Comprehensive_Drift_Analysis_Output"
 )
 
 SESSION_PKL_DIR = os.path.join(OUTPUT_DIR, "session_pickles")
 CSV_DIR = os.path.join(OUTPUT_DIR, "csv")
+STATS_CSV_DIR = os.path.join(CSV_DIR, "statistics")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 
 FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
 ROW_HEATMAP_DIR = os.path.join(FIG_DIR, "row_heatmaps")
-LEARNING_DIR = os.path.join(FIG_DIR, "learning")
-LT_ROT_DIR = os.path.join(FIG_DIR, "lt_rot")
-DEEP_SUP_DIR = os.path.join(FIG_DIR, "deep_superficial_all_datasets")
-
-SESSION_CSV = os.path.join(CSV_DIR, "corr_matrix_drift_per_session.csv")
-MATRIX_ENTRIES_CSV = os.path.join(CSV_DIR, "corr_matrix_similarity_entries.csv")
-LAG_CSV = os.path.join(CSV_DIR, "corr_matrix_lag_summary.csv")
-FAILED_ROWS_CSV = os.path.join(CSV_DIR, "failed_rows.csv")
 
 # =============================================================================
 # PARAMETERS
@@ -81,115 +64,31 @@ FAILED_ROWS_CSV = os.path.join(CSV_DIR, "failed_rows.csv")
 MAX_ROWS = None
 DATASET_FILTER = None
 
-# Global-time chunks
 N_CHUNKS = 5
-
-REMOVE_MOV_DIR_ZERO = True
-ZSCORE_CELLS = True
-
-# Correlation matrix estimation
 MIN_TIMEPOINTS_PER_CHUNK = 10
 MIN_NEURONS = 5
-
-# Similarity between correlation matrices
-# Main mode: Pearson correlation between upper triangles
-MATRIX_SIMILARITY_METRIC = "pearson"
-
-# Correlation matrix method
-CORR_METHOD = "pearson"
-
-# Save signed values by default.
-CLIP_NEGATIVE_SIMILARITY_IN_RESULTS = False
-
-# Plotting
+ZSCORE_CELLS = True
+REMOVE_MOV_DIR_ZERO = True
+EXCLUDE_ZERO_LAG_IN_REGRESSION = True
 EXCLUDE_ZERO_LAG_IN_PLOTS = True
 
-# Heatmaps can stay fixed for comparability
 HEATMAP_VMIN = -1.0
 HEATMAP_VMAX = 1.0
 
-# Automatic y-limit padding for summary plots
-YLIM_PADDING_FRAC = 0.08
-
-PROCESS_WHOLE_POPULATION = True
-
-# =============================================================================
-# COLORS
-# =============================================================================
-
 DEEP_COLOR = "#D4A928"
 SUPERFICIAL_COLOR = "#A020F0"
+WHOLE_POP_COLOR = "#666666"
 
 
 def get_learning_gray_palette(n_sessions):
     if n_sessions <= 1:
         return ["#666666"]
-
     vals = np.linspace(0.25, 0.80, n_sessions)
     return [str(v) for v in vals]
 
 
 # =============================================================================
-# CSV SCHEMAS
-# =============================================================================
-
-SESSION_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "condition",
-    "standardized_file_path",
-    "row_index",
-    "n_chunks",
-    "corr_method",
-    "matrix_similarity_metric",
-    "n_neurons",
-    "n_timepoints_original",
-    "n_timepoints_after_filter",
-    "mean_similarity_all",
-    "mean_similarity_offdiag",
-    "session_pickle_name",
-    "session_pickle_path",
-]
-
-MATRIX_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "condition",
-    "row_index",
-    "chunk_i",
-    "chunk_j",
-    "lag",
-    "corr_matrix_similarity",
-]
-
-LAG_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "condition",
-    "row_index",
-    "lag",
-    "corr_matrix_similarity",
-]
-
-FAILED_COLUMNS = [
-    "row_index",
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "standardized_file_path",
-    "error",
-]
-
-
-# =============================================================================
-# GENERAL HELPERS
+# HELPERS & DIRECTORIES
 # =============================================================================
 
 def ensure_dir(path):
@@ -198,15 +97,8 @@ def ensure_dir(path):
 
 def ensure_all_dirs():
     for path in [
-        OUTPUT_DIR,
-        SESSION_PKL_DIR,
-        CSV_DIR,
-        LOG_DIR,
-        FIG_DIR,
-        ROW_HEATMAP_DIR,
-        LEARNING_DIR,
-        LT_ROT_DIR,
-        DEEP_SUP_DIR,
+        OUTPUT_DIR, SESSION_PKL_DIR, CSV_DIR, STATS_CSV_DIR,
+        LOG_DIR, FIG_DIR, ROW_HEATMAP_DIR,
     ]:
         ensure_dir(path)
 
@@ -248,44 +140,29 @@ def savefig_png_svg(fig, out_base):
 
 def sanitize_filename(text):
     text = str(text)
-    safe = []
-
-    for ch in text:
-        if ch.isalnum() or ch in ["-", "_"]:
-            safe.append(ch)
-        else:
-            safe.append("_")
-
-    return "".join(safe)
+    return "".join([ch if ch.isalnum() or ch in ["-", "_"] else "_" for ch in text])
 
 
 def ensure_1d(x):
     x = np.asarray(x)
-
     if x.ndim == 2 and x.shape[1] == 1:
         x = x[:, 0]
-
     return x.reshape(-1)
 
 
 def ensure_2d(x):
     x = np.asarray(x)
-
     if x.ndim == 1:
         x = x.reshape(-1, 1)
-
     return x
 
 
 def get_pos_1d(pos):
     pos = np.asarray(pos)
-
     if pos.ndim == 1:
         return pos
-
     if pos.ndim == 2:
         return pos[:, 0]
-
     raise ValueError(f"Unexpected pos shape: {pos.shape}")
 
 
@@ -304,114 +181,63 @@ class Tee:
 
 
 # =============================================================================
-# METADATA HELPERS
+# METADATA & STRICT CONDITION PARSING
 # =============================================================================
 
 def normalize_depth(depth):
     depth = str(depth).lower()
-
-    if depth in ["sup", "superficial"]:
-        return "superficial"
-    if "super" in depth:
+    if depth in ["sup", "superficial"] or "super" in depth:
         return "superficial"
     if "deep" in depth:
         return "deep"
     if "whole" in depth:
         return "whole_population"
-
     return depth
 
 
 def infer_condition(row):
     dataset = str(row.get("dataset_name", "")).lower()
     session = str(row.get("session_name", "")).lower()
-    path = str(row.get("standardized_file_path", "")).lower()
 
-    # lt_rot condition must come from session name
-    if "lt_rot" in dataset or ("lt" in dataset and "rot" in dataset):
-        if "rot" in session:
-            return "rot"
-        if "lt" in session:
-            return "lt"
-        if "rot" in path:
-            return "rot"
-        if "lt" in path:
-            return "lt"
-        return "unknown_lt_rot_condition"
-
-    session_path_text = " ".join([session, path])
+    # Strict separation for lt_rot dataset based solely on session_name patterns
+    if "lt_rot" in dataset:
+        if "_rot_" in session or session.endswith("_rot") or "rot_" in session:
+            return "lt_rot_rot"
+        if "_lt_" in session or session.endswith("_lt") or "lt_" in session:
+            return "lt_rot_lt"
 
     if "dreadds" in dataset or "dreads" in dataset:
-        if "cno" in session_path_text:
-            return "cno"
-        if "saline" in session_path_text:
-            return "saline"
-        if "veh" in session_path_text or "vehicle" in session_path_text:
-            return "vehicle"
-        if "pre" in session_path_text:
-            return "pre"
-        if "post" in session_path_text:
-            return "post"
+        path = str(row.get("standardized_file_path", "")).lower()
+        text = f"{session} {path}"
+        if "cno" in text: return "cno"
+        if "saline" in text: return "saline"
+        if "veh" in text or "vehicle" in text: return "vehicle"
         return "dreadds"
-
     if "egrin" in dataset:
-        if "pre" in session_path_text:
-            return "pre"
-        if "post" in session_path_text:
-            return "post"
-        if "baseline" in session_path_text:
-            return "baseline"
-        if "stim" in session_path_text:
-            return "stim"
+        path = str(row.get("standardized_file_path", "")).lower()
+        text = f"{session} {path}"
+        if "pre" in text: return "pre"
+        if "post" in text: return "post"
+        if "stim" in text: return "stim"
         return "egrin"
 
-    if "rot" in session:
-        return "rot"
-    if "lt" in session:
-        return "lt"
-    if "pre" in session_path_text:
-        return "pre"
-    if "post" in session_path_text:
-        return "post"
-
-    return str(row.get("session_name", "unknown_condition"))
+    return session
 
 
 def extract_learning_datetime_from_session(session_name):
     text = str(session_name)
-
     match = re.search(r"(\d{8})[_\-]?(\d{6})", text)
     if match is not None:
-        date_part = match.group(1)
-        time_part = match.group(2)
-
         try:
-            return pd.to_datetime(date_part + time_part, format="%Y%m%d%H%M%S")
+            return pd.to_datetime(match.group(1) + match.group(2), format="%Y%m%d%H%M%S")
         except Exception:
             pass
-
     match = re.search(r"(\d{8})", text)
     if match is not None:
-        date_part = match.group(1)
-
         try:
-            return pd.to_datetime(date_part, format="%Y%m%d")
+            return pd.to_datetime(match.group(1), format="%Y%m%d")
         except Exception:
             pass
-
-    match = re.search(
-        r"(\d{4})[_\-](\d{1,2})[_\-](\d{1,2})[_\-](\d{1,2})[_\-](\d{1,2})[_\-](\d{1,2})",
-        text,
-    )
-
-    if match is not None:
-        y, mo, d, h, mi, s = match.groups()
-
-        try:
-            return pd.to_datetime(f"{y}-{mo}-{d} {h}:{mi}:{s}")
-        except Exception:
-            pass
-
     try:
         return pd.to_datetime(text)
     except Exception:
@@ -419,50 +245,36 @@ def extract_learning_datetime_from_session(session_name):
 
 
 def build_learning_session_mapping_by_mouse(matrix_df):
-    session_df = (
-        matrix_df[["mouse_name", "session_name"]]
-        .drop_duplicates()
-        .copy()
-    )
-
-    session_df["session_datetime"] = session_df["session_name"].apply(
-        extract_learning_datetime_from_session
-    )
-
-    session_df = session_df.sort_values(
-        ["mouse_name", "session_datetime", "session_name"],
-        na_position="last",
-    ).reset_index(drop=True)
-
+    session_df = matrix_df[["mouse_name", "session_name"]].drop_duplicates().copy()
+    session_df["session_datetime"] = session_df["session_name"].apply(extract_learning_datetime_from_session)
+    session_df = session_df.sort_values(["mouse_name", "session_datetime", "session_name"],
+                                        na_position="last").reset_index(drop=True)
     session_df["session_order"] = session_df.groupby("mouse_name").cumcount() + 1
     session_df["learning_session"] = "session_" + session_df["session_order"].astype(str)
-
     return session_df
 
 
 # =============================================================================
-# DATA LOADING
+# DATA LOADING & DRIFT COMPUTATION METHODS
 # =============================================================================
 
 def load_standardized_row(row_idx, row):
     standardized_file_path = row["standardized_file_path"]
+    if isinstance(standardized_file_path, str):
+        if "/home/melisamc/Documents/time_project_standarization" in standardized_file_path:
+            standardized_file_path = standardized_file_path.replace(
+                "/home/melisamc/Documents/time_project_standarization",
+                "/home/hippolab/Documents/melisa/time_project_standarization"
+            )
 
     if not os.path.isfile(standardized_file_path):
-        raise FileNotFoundError(
-            f"Missing standardized file for row {row_idx}: "
-            f"{standardized_file_path}"
-        )
+        raise FileNotFoundError(f"Missing standardized file for row {row_idx}: {standardized_file_path}")
 
     data = load_pickle_standard(standardized_file_path)
-
     required_keys = ["signal", "pos", "mov_dir", "speed", "time"]
-
     for key in required_keys:
         if key not in data:
-            raise KeyError(
-                f"Row {row_idx}: missing key '{key}' in "
-                f"{standardized_file_path}. Available keys: {list(data.keys())}"
-            )
+            raise KeyError(f"Row {row_idx}: missing key '{key}'")
 
     signal = ensure_2d(data["signal"])
     pos = ensure_1d(get_pos_1d(data["pos"]))
@@ -474,559 +286,355 @@ def load_standardized_row(row_idx, row):
 
     def check_len(x, name):
         if len(x) != n_time:
-            raise ValueError(
-                f"Row {row_idx}: length mismatch for {name}. "
-                f"Expected {n_time}, got {len(x)}"
-            )
+            raise ValueError(f"Row {row_idx}: length mismatch for {name}")
         return x
 
-    pos = check_len(pos, "pos")
-    mov_dir = check_len(mov_dir, "mov_dir")
-    speed = check_len(speed, "speed")
-    time = check_len(time, "time")
-
     behavior = {
-        "pos": pos,
-        "mov_dir": mov_dir,
-        "speed": speed,
-        "time": time,
+        "pos": check_len(pos, "pos"),
+        "mov_dir": check_len(mov_dir, "mov_dir"),
+        "speed": check_len(speed, "speed"),
+        "time": check_len(time, "time"),
     }
-
     return signal.astype(float), behavior
 
-
-# =============================================================================
-# CORRELATION-MATRIX DRIFT COMPUTATION
-# =============================================================================
 
 def zscore_activity_cells(signal):
     mu = np.nanmean(signal, axis=0, keepdims=True)
     sd = np.nanstd(signal, axis=0, keepdims=True)
-
     sd[sd == 0] = np.nan
-
     z = (signal - mu) / sd
-    z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return z
+    return np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def split_indices_equal(n_time, n_chunks):
-    indices = np.arange(n_time)
-    return [x for x in np.array_split(indices, n_chunks)]
-
-
-def compute_neuron_corr_matrix(signal_chunk):
-    """
-    signal_chunk: time x neurons
-    """
-    if signal_chunk.shape[0] < MIN_TIMEPOINTS_PER_CHUNK:
-        return np.full((signal_chunk.shape[1], signal_chunk.shape[1]), np.nan)
-
-    if signal_chunk.shape[1] < MIN_NEURONS:
-        return np.full((signal_chunk.shape[1], signal_chunk.shape[1]), np.nan)
-
-    if CORR_METHOD != "pearson":
-        raise ValueError(f"Unknown CORR_METHOD: {CORR_METHOD}")
-
-    corr_mat = np.corrcoef(signal_chunk, rowvar=False)
-
-    return corr_mat
-
-
-def vectorize_corr_matrix(corr_mat):
-    corr_mat = np.asarray(corr_mat, dtype=float)
-
-    if corr_mat.ndim != 2 or corr_mat.shape[0] != corr_mat.shape[1]:
-        raise ValueError(f"Expected square matrix, got {corr_mat.shape}")
-
-    n = corr_mat.shape[0]
-    idx = np.triu_indices(n, k=1)
-
-    return corr_mat[idx]
-
-
-def safe_corr(x, y):
-    x = np.asarray(x, dtype=float).reshape(-1)
-    y = np.asarray(y, dtype=float).reshape(-1)
-
-    valid = np.isfinite(x) & np.isfinite(y)
-
-    x = x[valid]
-    y = y[valid]
-
-    if len(x) < 3:
-        return np.nan
-
-    if np.nanstd(x) == 0 or np.nanstd(y) == 0:
-        return np.nan
-
-    return float(np.corrcoef(x, y)[0, 1])
-
-
-def compute_matrix_similarity(vec_a, vec_b):
-    if MATRIX_SIMILARITY_METRIC == "pearson":
-        return safe_corr(vec_a, vec_b)
-
-    raise ValueError(f"Unknown MATRIX_SIMILARITY_METRIC: {MATRIX_SIMILARITY_METRIC}")
+    return [x for x in np.array_split(np.arange(n_time), n_chunks)]
 
 
 def compute_corr_matrix_drift(signal):
-    """
-    Returns:
-        similarity_matrix: N_CHUNKS x N_CHUNKS
-        corr_mats: list of neuron-neuron correlation matrices
-        corr_vecs: list of upper-triangle vectors
-        chunk_indices: list of indices
-    """
     if ZSCORE_CELLS:
         signal = zscore_activity_cells(signal)
-
     chunk_indices = split_indices_equal(signal.shape[0], N_CHUNKS)
-
-    corr_mats = []
     corr_vecs = []
-
     for idx in chunk_indices:
         signal_chunk = signal[idx, :]
-
-        corr_mat = compute_neuron_corr_matrix(signal_chunk)
-        corr_vec = vectorize_corr_matrix(corr_mat)
-
-        corr_mats.append(corr_mat)
+        if signal_chunk.shape[0] < MIN_TIMEPOINTS_PER_CHUNK or signal_chunk.shape[1] < MIN_NEURONS:
+            corr_vec = np.array([])
+        else:
+            corr_mat = np.corrcoef(signal_chunk, rowvar=False)
+            corr_vec = corr_mat[np.triu_indices(corr_mat.shape[0], k=1)]
         corr_vecs.append(corr_vec)
 
     similarity_matrix = np.full((N_CHUNKS, N_CHUNKS), np.nan)
-
     for i in range(N_CHUNKS):
         for j in range(N_CHUNKS):
-            similarity_matrix[i, j] = compute_matrix_similarity(
-                corr_vecs[i],
-                corr_vecs[j],
-            )
+            va, vb = corr_vecs[i], corr_vecs[j]
+            valid = np.isfinite(va) & np.isfinite(vb)
+            if np.sum(valid) >= 3 and np.nanstd(va[valid]) > 0 and np.nanstd(vb[valid]) > 0:
+                similarity_matrix[i, j] = float(np.corrcoef(va[valid], vb[valid])[0, 1])
+    return similarity_matrix, chunk_indices
 
-    if CLIP_NEGATIVE_SIMILARITY_IN_RESULTS:
-        similarity_matrix = np.where(
-            np.isfinite(similarity_matrix),
-            np.clip(similarity_matrix, 0.0, 1.0),
-            np.nan,
-        )
 
-    return similarity_matrix, corr_mats, corr_vecs, chunk_indices
+def compute_elementwise_pv_drift(signal):
+    if ZSCORE_CELLS:
+        signal = zscore_activity_cells(signal)
+    chunk_indices = split_indices_equal(signal.shape[0], N_CHUNKS)
+    similarity_matrix = np.full((N_CHUNKS, N_CHUNKS), np.nan)
+    for i in range(N_CHUNKS):
+        idx_i = chunk_indices[i]
+        if len(idx_i) < 2: continue
+        chunk_i_sig = signal[idx_i, :]
+        for j in range(N_CHUNKS):
+            idx_j = chunk_indices[j]
+            if len(idx_j) < 2: continue
+            chunk_j_sig = signal[idx_j, :]
+            corr_full = np.corrcoef(chunk_i_sig, chunk_j_sig, rowvar=True)
+            T_i = chunk_i_sig.shape[0]
+            sub_corr = corr_full[:T_i, T_i:]
+            valid_vals = sub_corr[np.isfinite(sub_corr)]
+            if len(valid_vals) > 0:
+                similarity_matrix[i, j] = float(np.nanmean(valid_vals))
+    return similarity_matrix, chunk_indices
+
+
+def compute_rsa_drift(signal):
+    if ZSCORE_CELLS:
+        signal = zscore_activity_cells(signal)
+    chunk_indices = split_indices_equal(signal.shape[0], N_CHUNKS)
+    rdms = []
+    T_fixed = 20
+    for idx in chunk_indices:
+        chunk_sig = signal[idx, :]
+        if chunk_sig.shape[0] < MIN_TIMEPOINTS_PER_CHUNK:
+            rdms.append(None)
+            continue
+        indices = np.linspace(0, chunk_sig.shape[0] - 1, T_fixed).astype(int)
+        resampled = chunk_sig[indices, :]
+        rdm = np.corrcoef(resampled, rowvar=True)
+        rdm_vec = rdm[np.triu_indices(T_fixed, k=1)]
+        rdms.append(rdm_vec)
+
+    similarity_matrix = np.full((N_CHUNKS, N_CHUNKS), np.nan)
+    for i in range(N_CHUNKS):
+        for j in range(N_CHUNKS):
+            ra, rb = rdms[i], rdms[j]
+            if ra is not None and rb is not None:
+                valid = np.isfinite(ra) & np.isfinite(rb)
+                if np.sum(valid) >= 3 and np.nanstd(ra[valid]) > 0 and np.nanstd(rb[valid]) > 0:
+                    similarity_matrix[i, j] = float(np.corrcoef(ra[valid], rb[valid])[0, 1])
+    return similarity_matrix, chunk_indices
+
+
+def compute_procrustes_drift(signal):
+    if ZSCORE_CELLS:
+        signal = zscore_activity_cells(signal)
+    pca = PCA(n_components=min(3, signal.shape[1]))
+    embedding = pca.fit_transform(signal)
+    chunk_indices = split_indices_equal(signal.shape[0], N_CHUNKS)
+    chunk_trajectories = []
+    T_fixed = 20
+    for idx in chunk_indices:
+        traj = embedding[idx, :]
+        if traj.shape[0] < MIN_TIMEPOINTS_PER_CHUNK:
+            chunk_trajectories.append(None)
+            continue
+        indices = np.linspace(0, traj.shape[0] - 1, T_fixed).astype(int)
+        resampled_traj = traj[indices, :]
+        chunk_trajectories.append(resampled_traj)
+
+    similarity_matrix = np.full((N_CHUNKS, N_CHUNKS), np.nan)
+    for i in range(N_CHUNKS):
+        for j in range(N_CHUNKS):
+            ta, tb = chunk_trajectories[i], chunk_trajectories[j]
+            if ta is not None and tb is not None:
+                try:
+                    _, _, disparity = procrustes(ta, tb)
+                    similarity_matrix[i, j] = float(max(0.0, 1.0 - disparity))
+                except Exception:
+                    pass
+    return similarity_matrix, chunk_indices
 
 
 def matrix_to_lag_summary(mat):
     out = {}
-
     n = mat.shape[0]
-
     for lag in range(n):
-        vals = []
-
-        for i in range(n):
-            for j in range(n):
-                if abs(i - j) == lag:
-                    vals.append(mat[i, j])
-
-        out[lag] = float(np.nanmean(vals))
-
+        vals = [mat[i, j] for i in range(n) for j in range(n) if abs(i - j) == lag]
+        out[lag] = float(np.nanmean(vals)) if vals else np.nan
     return out
 
 
+def fit_linear_regression(lag_summary):
+    lags = sorted(
+        [k for k, v in lag_summary.items() if not (EXCLUDE_ZERO_LAG_IN_REGRESSION and k == 0) and np.isfinite(v)])
+    vals = [lag_summary[k] for k in lags]
+    if len(lags) < 2:
+        return np.nan, np.nan, np.nan
+    slope, intercept, _, _, _ = linregress(lags, vals)
+    return slope, intercept, 0.0
+
+
 def mean_offdiagonal(mat):
-    vals = []
-
-    for i in range(mat.shape[0]):
-        for j in range(mat.shape[1]):
-            if i != j:
-                vals.append(mat[i, j])
-
-    return float(np.nanmean(vals))
+    vals = [mat[i, j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i != j]
+    return float(np.nanmean(vals)) if vals else np.nan
 
 
 # =============================================================================
-# PLOTTING HELPERS
+# STATISTICAL TESTS, ANOVA & POSTHOC
 # =============================================================================
 
-def get_nonzero_lags(df, lag_col="lag"):
-    lags = sorted(df[lag_col].dropna().unique())
+def run_2way_anova_with_posthoc(lag_df, group_col, value_col, out_stat_dir, prefix):
+    clean_df = lag_df[[group_col, "lag", value_col]].dropna()
+    if len(clean_df) < 5 or clean_df[group_col].nunique() < 2:
+        return None
+    try:
+        model = ols(f"{value_col} ~ C({group_col}) + C(lag) + C({group_col}):C(lag)", data=clean_df).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        anova_table.to_csv(os.path.join(out_stat_dir, f"{prefix}_2way_anova.csv"))
 
-    if EXCLUDE_ZERO_LAG_IN_PLOTS:
-        lags = [lag for lag in lags if lag > 0]
-
-    return lags
-
-
-def compute_auto_ylim_from_values(values, padding_frac=YLIM_PADDING_FRAC):
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if len(values) == 0:
-        return -1.0, 1.0
-
-    ymin = float(np.nanmin(values))
-    ymax = float(np.nanmax(values))
-
-    if ymin == ymax:
-        pad = max(abs(ymin), 1.0) * 0.1
-        return ymin - pad, ymax + pad
-
-    yrange = ymax - ymin
-    return ymin - padding_frac * yrange, ymax + padding_frac * yrange
+        tukey = pairwise_tukeyhsd(endog=clean_df[value_col], groups=clean_df[group_col], alpha=0.05)
+        tukey_df = pd.DataFrame(data=tukey._results_table.data[1:], columns=tukey._results_table.data[0])
+        tukey_df.to_csv(os.path.join(out_stat_dir, f"{prefix}_tukey_hsd.csv"), index=False)
+        return anova_table
+    except Exception:
+        return None
 
 
-def compute_ylim_from_plot_df(df, value_col="corr_matrix_similarity"):
-    plot_df = df.copy()
+def run_group_statistical_comparison(df, group_col, value_col, out_csv_path):
+    groups = df[group_col].dropna().unique()
+    if len(groups) != 2:
+        return
+    g1, g2 = groups[0], groups[1]
+    vals1 = df[df[group_col] == g1][value_col].dropna().values
+    vals2 = df[df[group_col] == g2][value_col].dropna().values
+    if len(vals1) < 2 or len(vals2) < 2:
+        return
 
-    if EXCLUDE_ZERO_LAG_IN_PLOTS and "lag" in plot_df.columns:
-        plot_df = plot_df[plot_df["lag"] > 0].copy()
+    t_stat, t_pval = ttest_ind(vals1, vals2, equal_var=False)
+    mwu_stat, mwu_pval = mannwhitneyu(vals1, vals2, alternative="two-sided")
 
-    return compute_auto_ylim_from_values(plot_df[value_col].values)
+    stat_results = [{
+        "comparison_variable": value_col,
+        "group_1": str(g1), "mean_1": float(np.mean(vals1)), "std_1": float(np.std(vals1)), "n_1": len(vals1),
+        "group_2": str(g2), "mean_2": float(np.mean(vals2)), "std_2": float(np.std(vals2)), "n_2": len(vals2),
+        "welch_t_stat": float(t_stat), "welch_t_pval": float(t_pval),
+        "mann_whitney_u": float(mwu_stat), "mann_whitney_pval": float(mwu_pval)
+    }]
+    init_csv(out_csv_path, stat_results[0].keys())
+    append_many_csv_rows(out_csv_path, stat_results[0].keys(), stat_results)
 
+
+# =============================================================================
+# PLOTTING HELPERS WITH SAFE BOUNDS & SIGNIFICANCE BARS
+# =============================================================================
 
 def plot_similarity_matrix(mat, title, out_base):
     fig, ax = plt.subplots(figsize=(5.6, 5.0))
-
-    im = ax.imshow(
-        np.clip(mat, HEATMAP_VMIN, HEATMAP_VMAX),
-        vmin=HEATMAP_VMIN,
-        vmax=HEATMAP_VMAX,
-        origin="upper",
-        aspect="equal",
-    )
-
+    im = ax.imshow(np.clip(mat, HEATMAP_VMIN, HEATMAP_VMAX), vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, origin="upper",
+                   aspect="equal")
     ax.set_title(title, fontsize=9)
     ax.set_xlabel("Global chunk")
     ax.set_ylabel("Global chunk")
-
     ax.set_xticks(np.arange(N_CHUNKS))
     ax.set_yticks(np.arange(N_CHUNKS))
     ax.set_xticklabels([str(i + 1) for i in range(N_CHUNKS)], fontsize=6)
     ax.set_yticklabels([str(i + 1) for i in range(N_CHUNKS)], fontsize=6)
-
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Correlation-matrix similarity")
-
+    cbar.set_label("Similarity / Correlation")
     fig.tight_layout()
     savefig_png_svg(fig, out_base)
 
 
-def plot_learning_lag_curves(df, title, out_base, session_order):
-    if len(df) == 0:
+def add_significance_bracket(ax, x1, x2, y, text, h=0.02):
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.2, c="black")
+    ax.text((x1 + x2) * 0.5, y + h, text, ha="center", va="bottom", color="black", fontsize=10)
+
+
+def plot_lag_barplot_with_points(lag_df, group_col, title, out_base, palette_dict=None, is_gray_scale=False):
+    groups = lag_df[group_col].dropna().unique()
+    if len(groups) == 0:
         return
 
-    lags = get_nonzero_lags(df)
-    if len(lags) == 0:
-        return
+    lags = sorted(lag_df["lag"].dropna().unique())
+    if EXCLUDE_ZERO_LAG_IN_PLOTS:
+        lags = [l for l in lags if l > 0]
 
-    y_min, y_max = compute_ylim_from_plot_df(df)
+    stats = lag_df.groupby([group_col, "lag"])["similarity"].agg(["mean", "sem"]).reset_index()
 
-    means = (
-        df.groupby(["learning_session", "lag"], observed=True)["corr_matrix_similarity"]
-        .mean()
-        .reset_index()
-    )
-
-    sems = (
-        df.groupby(["learning_session", "lag"], observed=True)["corr_matrix_similarity"]
-        .sem()
-        .reset_index()
-        .rename(columns={"corr_matrix_similarity": "sem"})
-    )
-
-    stats = means.merge(sems, on=["learning_session", "lag"], how="left")
-    gray_colors = get_learning_gray_palette(len(session_order))
-
-    fig, ax = plt.subplots(figsize=(8.0, 4.8))
-
-    for k, session in enumerate(session_order):
-        y = []
-        yerr = []
-
-        for lag in lags:
-            sub = stats[
-                (stats["learning_session"] == session)
-                & (stats["lag"] == lag)
-                ]
-
-            if len(sub) == 0:
-                y.append(np.nan)
-                yerr.append(np.nan)
-            else:
-                y.append(float(sub["corr_matrix_similarity"].iloc[0]))
-                yerr.append(float(sub["sem"].iloc[0]))
-
-        y = np.asarray(y, dtype=float)
-        yerr = np.nan_to_num(np.asarray(yerr, dtype=float), nan=0.0)
-
-        ax.plot(
-            lags,
-            y,
-            marker="o",
-            linewidth=2.0,
-            markersize=5,
-            color=gray_colors[k],
-            label=session,
-        )
-
-        ax.fill_between(
-            lags,
-            y - yerr,
-            y + yerr,
-            color=gray_colors[k],
-            alpha=0.20,
-            linewidth=0,
-        )
-
-    ax.axhline(0, color="black", linewidth=0.8, alpha=0.4)
-    ax.set_title(title)
-    ax.set_xlabel("|Δ chunk|")
-    ax.set_ylabel("Correlation-matrix similarity")
-    ax.set_ylim(y_min, y_max)
-    ax.set_xticks(lags)
-    ax.legend(frameon=False, ncol=2)
-
-    fig.tight_layout()
-    savefig_png_svg(fig, out_base)
-
-
-def plot_learning_lag_barplot(df, title, out_base, session_order):
-    if len(df) == 0:
-        return
-
-    lags = get_nonzero_lags(df)
-    if len(lags) == 0:
-        return
-
-    y_min, y_max = compute_ylim_from_plot_df(df)
-
-    means = (
-        df.groupby(["learning_session", "lag"], observed=True)["corr_matrix_similarity"]
-        .mean()
-        .reset_index()
-    )
-
-    sems = (
-        df.groupby(["learning_session", "lag"], observed=True)["corr_matrix_similarity"]
-        .sem()
-        .reset_index()
-        .rename(columns={"corr_matrix_similarity": "sem"})
-    )
-
-    stats = means.merge(sems, on=["learning_session", "lag"], how="left")
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    colors = get_learning_gray_palette(len(groups)) if is_gray_scale else [palette_dict.get(str(g), "#1f77b4") for g in
+                                                                           groups]
 
     x = np.arange(len(lags))
-    width = 0.85 / max(len(session_order), 1)
-    gray_colors = get_learning_gray_palette(len(session_order))
+    width = 0.8 / len(groups)
 
-    fig, ax = plt.subplots(figsize=(11.0, 4.8))
+    for idx, g in enumerate(groups):
+        sub_stats = stats[stats[group_col] == g]
+        means = [sub_stats[sub_stats["lag"] == l]["mean"].values[0] if l in sub_stats["lag"].values else np.nan for l in
+                 lags]
+        sems = [sub_stats[sub_stats["lag"] == l]["sem"].values[0] if l in sub_stats["lag"].values else 0.0 for l in
+                lags]
 
-    for k, session in enumerate(session_order):
-        y = []
-        yerr = []
+        offset = (idx - (len(groups) - 1) / 2) * width
+        color = colors[idx]
 
-        for lag in lags:
-            sub = stats[
-                (stats["learning_session"] == session)
-                & (stats["lag"] == lag)
-                ]
+        ax.bar(x + offset, means, width=width, yerr=sems, capsize=3, color=color, edgecolor="black", linewidth=0.7,
+               label=str(g), alpha=0.85)
 
-            if len(sub) == 0:
-                y.append(np.nan)
-                yerr.append(np.nan)
-            else:
-                y.append(float(sub["corr_matrix_similarity"].iloc[0]))
-                yerr.append(float(sub["sem"].iloc[0]))
+        for lag_idx, l in enumerate(lags):
+            indiv_vals = lag_df[(lag_df[group_col] == g) & (lag_df["lag"] == l)]["similarity"].dropna().values
+            x_pts = np.random.normal(x[lag_idx] + offset, 0.02, size=len(indiv_vals))
+            ax.scatter(x_pts, indiv_vals, color="black", s=12, alpha=0.5, zorder=5)
 
-        offset = (k - (len(session_order) - 1) / 2) * width
-
-        ax.bar(
-            x + offset,
-            y,
-            width=width,
-            yerr=np.nan_to_num(yerr, nan=0.0),
-            capsize=2,
-            color=gray_colors[k],
-            edgecolor="black",
-            linewidth=0.7,
-            label=session,
-        )
-
-    ax.axhline(0, color="black", linewidth=0.8, alpha=0.4)
-    ax.set_title(title)
-    ax.set_xlabel("|Δ chunk|")
-    ax.set_ylabel("Correlation-matrix similarity")
-    ax.set_ylim(y_min, y_max)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("|Δ chunk| (Lag)", fontsize=10)
+    ax.set_ylabel("Similarity / Correlation", fontsize=10)
+    ax.set_ylim(-0.1, 1.15)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(int(lag)) for lag in lags])
-    ax.legend(frameon=False, ncol=2)
-
+    ax.set_xticklabels([str(l) for l in lags])
+    ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
     savefig_png_svg(fig, out_base)
 
 
-def plot_deep_sup_lag_curves(df, title, out_base):
-    df = df[df["depth_type"].isin(["deep", "superficial"])].copy()
-
-    if len(df) == 0:
+def plot_regression_lines(session_df, lag_df, group_col, title, out_base, palette_dict=None, is_gray_scale=False):
+    groups = session_df[group_col].dropna().unique()
+    if len(groups) == 0:
         return
 
-    lags = get_nonzero_lags(df)
-    if len(lags) == 0:
-        return
+    lags = sorted(lag_df["lag"].dropna().unique())
+    if EXCLUDE_ZERO_LAG_IN_REGRESSION:
+        lags = [l for l in lags if l > 0]
 
-    y_min, y_max = compute_ylim_from_plot_df(df)
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    colors = get_learning_gray_palette(len(groups)) if is_gray_scale else [palette_dict.get(str(g), "#1f77b4") for g in
+                                                                           groups]
 
-    depth_colors = {
-        "deep": DEEP_COLOR,
-        "superficial": SUPERFICIAL_COLOR,
-    }
+    for idx, g in enumerate(groups):
+        color = colors[idx]
+        group_sessions = session_df[session_df[group_col] == g]
 
-    means = (
-        df.groupby(["depth_type", "lag"], observed=True)["corr_matrix_similarity"]
-        .mean()
-        .reset_index()
-    )
+        for _, s_row in group_sessions.iterrows():
+            slope = s_row["regression_slope"]
+            intercept = s_row["regression_intercept"]
+            if np.isfinite(slope) and np.isfinite(intercept):
+                y_fit = [slope * l + intercept for l in lags]
+                ax.plot(lags, y_fit, color=color, alpha=0.2, linewidth=1.0)
 
-    sems = (
-        df.groupby(["depth_type", "lag"], observed=True)["corr_matrix_similarity"]
-        .sem()
-        .reset_index()
-        .rename(columns={"corr_matrix_similarity": "sem"})
-    )
-
-    stats = means.merge(sems, on=["depth_type", "lag"], how="left")
-
-    fig, ax = plt.subplots(figsize=(7.5, 4.8))
-
-    for depth in ["deep", "superficial"]:
-        y = []
-        yerr = []
-
-        for lag in lags:
-            sub = stats[
-                (stats["depth_type"] == depth)
-                & (stats["lag"] == lag)
-                ]
-
-            if len(sub) == 0:
-                y.append(np.nan)
-                yerr.append(np.nan)
-            else:
-                y.append(float(sub["corr_matrix_similarity"].iloc[0]))
-                yerr.append(float(sub["sem"].iloc[0]))
-
-        y = np.asarray(y, dtype=float)
-        yerr = np.nan_to_num(np.asarray(yerr, dtype=float), nan=0.0)
-
-        ax.plot(
-            lags,
-            y,
-            marker="o",
-            linewidth=2.5,
-            markersize=6,
-            color=depth_colors[depth],
-            label=depth,
-        )
-
-        ax.fill_between(
-            lags,
-            y - yerr,
-            y + yerr,
-            color=depth_colors[depth],
-            alpha=0.20,
-            linewidth=0,
-        )
+        mean_slope = group_sessions["regression_slope"].mean()
+        mean_intercept = group_sessions["regression_intercept"].mean()
+        if np.isfinite(mean_slope) and np.isfinite(mean_intercept):
+            y_mean_fit = [mean_slope * l + mean_intercept for l in lags]
+            ax.plot(lags, y_mean_fit, color=color, linewidth=2.8,
+                    label=f"{g} (Mean Fit: y={mean_slope:.3f}x+{mean_intercept:.3f})")
 
     ax.axhline(0, color="black", linewidth=0.8, alpha=0.4)
-    ax.set_title(title)
-    ax.set_xlabel("|Δ chunk|")
-    ax.set_ylabel("Correlation-matrix similarity")
-    ax.set_ylim(y_min, y_max)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("|Δ chunk| (Lag)", fontsize=10)
+    ax.set_ylabel("Similarity / Correlation (Regression Fit)", fontsize=10)
+    ax.set_ylim(-0.1, 1.05)
     ax.set_xticks(lags)
-    ax.legend(frameon=False)
-
+    ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
     savefig_png_svg(fig, out_base)
 
 
-def plot_deep_sup_lag_barplot(df, title, out_base):
-    df = df[df["depth_type"].isin(["deep", "superficial"])].copy()
-
-    if len(df) == 0:
+def plot_parameter_bar_comparison(session_df, group_col, param_col, title, out_base, p_val=None, palette_dict=None,
+                                  is_gray_scale=False):
+    groups = session_df[group_col].dropna().unique()
+    if len(groups) == 0:
         return
 
-    lags = get_nonzero_lags(df)
-    if len(lags) == 0:
-        return
+    means = session_df.groupby(group_col)[param_col].mean()
+    sems = session_df.groupby(group_col)[param_col].sem()
 
-    y_min, y_max = compute_ylim_from_plot_df(df)
+    fig, ax = plt.subplots(figsize=(6.5, 5.2))
+    x = np.arange(len(groups))
+    if is_gray_scale:
+        colors = get_learning_gray_palette(len(groups))
+    else:
+        colors = [palette_dict.get(str(g), "#1f77b4") for g in
+                  groups] if palette_dict is not None else ["#1f77b4"] * len(groups)
 
-    depth_colors = {
-        "deep": DEEP_COLOR,
-        "superficial": SUPERFICIAL_COLOR,
-    }
+    ax.bar(x, means, yerr=sems, capsize=4, color=colors, edgecolor="black", linewidth=0.8, alpha=0.85)
 
-    means = (
-        df.groupby(["depth_type", "lag"], observed=True)["corr_matrix_similarity"]
-        .mean()
-        .reset_index()
-    )
+    for idx, g in enumerate(groups):
+        pts = session_df[session_df[group_col] == g][param_col].dropna().values
+        x_pts = np.random.normal(x[idx], 0.03, size=len(pts))
+        ax.scatter(x_pts, pts, color="black", s=15, alpha=0.6, zorder=5)
 
-    sems = (
-        df.groupby(["depth_type", "lag"], observed=True)["corr_matrix_similarity"]
-        .sem()
-        .reset_index()
-        .rename(columns={"corr_matrix_similarity": "sem"})
-    )
+    if len(groups) == 2 and p_val is not None and np.isfinite(p_val):
+        max_val = np.nanmax(means + sems)
+        if not np.isfinite(max_val) or max_val <= 0:
+            max_val = 1.0
+        y_max = max_val * 1.15
+        sig_text = "***" if p_val < 0.001 else ("**" if p_val < 0.01 else ("*" if p_val < 0.05 else "ns"))
+        add_significance_bracket(ax, 0, 1, y_max, f"p={p_val:.3f} ({sig_text})")
+        ax.set_ylim(min(0, min(means) * 1.2), y_max * 1.25)
 
-    stats = means.merge(sems, on=["depth_type", "lag"], how="left")
-
-    x = np.arange(len(lags))
-    width = 0.35
-
-    fig, ax = plt.subplots(figsize=(8.0, 4.8))
-
-    for k, depth in enumerate(["deep", "superficial"]):
-        y = []
-        yerr = []
-
-        for lag in lags:
-            sub = stats[
-                (stats["depth_type"] == depth)
-                & (stats["lag"] == lag)
-                ]
-
-            if len(sub) == 0:
-                y.append(np.nan)
-                yerr.append(np.nan)
-            else:
-                y.append(float(sub["corr_matrix_similarity"].iloc[0]))
-                yerr.append(float(sub["sem"].iloc[0]))
-
-        offset = (k - 0.5) * width
-
-        ax.bar(
-            x + offset,
-            y,
-            width=width,
-            yerr=np.nan_to_num(yerr, nan=0.0),
-            capsize=2,
-            color=depth_colors[depth],
-            edgecolor="black",
-            linewidth=0.8,
-            label=depth,
-        )
-
-    ax.axhline(0, color="black", linewidth=0.8, alpha=0.4)
-    ax.set_title(title)
-    ax.set_xlabel("|Δ chunk|")
-    ax.set_ylabel("Correlation-matrix similarity")
-    ax.set_ylim(y_min, y_max)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(int(lag)) for lag in lags])
-    ax.legend(frameon=False)
-
+    ax.set_xticklabels([str(g) for g in groups], rotation=15)
+    ax.set_ylabel(f"Mean {param_col.replace('_', ' ').title()}", fontsize=10)
+    ax.set_title(title, fontsize=11)
     fig.tight_layout()
     savefig_png_svg(fig, out_base)
 
@@ -1035,38 +643,33 @@ def plot_deep_sup_lag_barplot(df, title, out_base):
 # ROW PROCESSING
 # =============================================================================
 
-def process_row(row_idx, row):
+def process_row(row_idx, row, analysis_type="cormat"):
     signal, behavior = load_standardized_row(row_idx, row)
-
     n_timepoints_original = signal.shape[0]
     n_neurons = signal.shape[1]
 
     if n_neurons < MIN_NEURONS:
         raise ValueError(f"Too few neurons: {n_neurons}")
 
-    if REMOVE_MOV_DIR_ZERO:
-        valid_idx = behavior["mov_dir"] != 0
-    else:
-        valid_idx = np.ones(signal.shape[0], dtype=bool)
-
+    valid_idx = behavior["mov_dir"] != 0 if REMOVE_MOV_DIR_ZERO else np.ones(n_timepoints_original, dtype=bool)
     signal_valid = signal[valid_idx, :]
 
-    n_timepoints_after_filter = signal_valid.shape[0]
+    if signal_valid.shape[0] < N_CHUNKS * MIN_TIMEPOINTS_PER_CHUNK:
+        raise ValueError(f"Too few timepoints after filtering")
 
-    if n_timepoints_after_filter < N_CHUNKS * MIN_TIMEPOINTS_PER_CHUNK:
-        raise ValueError(
-            f"Too few timepoints after filtering: "
-            f"{n_timepoints_after_filter}. "
-            f"Need at least {N_CHUNKS * MIN_TIMEPOINTS_PER_CHUNK}."
-        )
-
-    similarity_matrix, corr_mats, corr_vecs, chunk_indices = compute_corr_matrix_drift(
-        signal_valid
-    )
+    if analysis_type == "cormat":
+        similarity_matrix, _ = compute_corr_matrix_drift(signal_valid)
+    elif analysis_type == "pv_elementwise":
+        similarity_matrix, _ = compute_elementwise_pv_drift(signal_valid)
+    elif analysis_type == "rsa":
+        similarity_matrix, _ = compute_rsa_drift(signal_valid)
+    elif analysis_type == "procrustes":
+        similarity_matrix, _ = compute_procrustes_drift(signal_valid)
+    else:
+        raise ValueError(f"Unknown analysis type: {analysis_type}")
 
     lag_summary = matrix_to_lag_summary(similarity_matrix)
-    mean_similarity_all = float(np.nanmean(similarity_matrix))
-    mean_similarity_offdiag = mean_offdiagonal(similarity_matrix)
+    slope, intercept, pval = fit_linear_regression(lag_summary)
 
     dataset_name = row["dataset_name"]
     mouse_name = row["mouse_name"]
@@ -1074,664 +677,228 @@ def process_row(row_idx, row):
     depth_type = normalize_depth(row["depth_type"])
     condition = infer_condition(row)
 
-    session_base = (
-        f"row_{row_idx:04d}_"
-        f"{sanitize_filename(dataset_name)}_"
-        f"{sanitize_filename(mouse_name)}_"
-        f"{sanitize_filename(session_name)}_"
-        f"{sanitize_filename(depth_type)}_corrmatrix_drift"
-    )
-
-    session_pickle_name = session_base + ".pkl"
-    session_pickle_path = os.path.join(SESSION_PKL_DIR, session_pickle_name)
-
-    payload = {
-        "metadata": {
-            "dataset_name": dataset_name,
-            "mouse_name": mouse_name,
-            "session_name": session_name,
-            "depth_type": depth_type,
-            "condition": condition,
-            "row_index": row_idx,
-            "standardized_file_path": row["standardized_file_path"],
-            "n_chunks": N_CHUNKS,
-            "corr_method": CORR_METHOD,
-            "matrix_similarity_metric": MATRIX_SIMILARITY_METRIC,
-            "n_neurons": n_neurons,
-            "n_timepoints_original": n_timepoints_original,
-            "n_timepoints_after_filter": n_timepoints_after_filter,
-            "zscore_cells": ZSCORE_CELLS,
-            "remove_mov_dir_zero": REMOVE_MOV_DIR_ZERO,
-            "clip_negative_similarity": CLIP_NEGATIVE_SIMILARITY_IN_RESULTS,
-        },
-        "indices": {
-            "valid_idx_mov_dir_nonzero": valid_idx,
-            "chunk_indices_after_filter": chunk_indices,
-        },
-        "correlation_matrix_drift": {
-            "similarity_matrix": similarity_matrix,
-            "corr_mats": corr_mats,
-            "corr_vecs": corr_vecs,
-            "lag_summary": lag_summary,
-        },
-    }
-
-    save_pickle_standard(session_pickle_path, payload)
+    int_i_val = row.get("int_i", np.nan)
+    int_f_val = row.get("int_f", np.nan)
 
     session_row = {
-        "dataset_name": dataset_name,
-        "mouse_name": mouse_name,
-        "session_name": session_name,
-        "depth_type": depth_type,
-        "condition": condition,
+        "dataset_name": dataset_name, "mouse_name": mouse_name, "session_name": session_name,
+        "depth_type": depth_type, "condition": condition,
+        "int_i": int_i_val, "int_f": int_f_val,
         "standardized_file_path": row["standardized_file_path"],
-        "row_index": row_idx,
-        "n_chunks": N_CHUNKS,
-        "corr_method": CORR_METHOD,
-        "matrix_similarity_metric": MATRIX_SIMILARITY_METRIC,
-        "n_neurons": n_neurons,
-        "n_timepoints_original": n_timepoints_original,
-        "n_timepoints_after_filter": n_timepoints_after_filter,
-        "mean_similarity_all": mean_similarity_all,
-        "mean_similarity_offdiag": mean_similarity_offdiag,
-        "session_pickle_name": session_pickle_name,
-        "session_pickle_path": session_pickle_path,
+        "row_index": row_idx, "n_chunks": N_CHUNKS, "n_neurons": n_neurons,
+        "regression_slope": slope, "regression_intercept": intercept, "regression_pval": pval,
     }
 
-    matrix_rows = []
+    lag_rows = [{
+        "dataset_name": dataset_name, "mouse_name": mouse_name, "session_name": session_name,
+        "depth_type": depth_type, "condition": condition,
+        "int_i": int_i_val, "int_f": int_f_val, "row_index": row_idx,
+        "lag": lag, "similarity": val
+    } for lag, val in lag_summary.items()]
 
-    for i in range(N_CHUNKS):
-        for j in range(N_CHUNKS):
-            matrix_rows.append(
-                {
-                    "dataset_name": dataset_name,
-                    "mouse_name": mouse_name,
-                    "session_name": session_name,
-                    "depth_type": depth_type,
-                    "condition": condition,
-                    "row_index": row_idx,
-                    "chunk_i": i + 1,
-                    "chunk_j": j + 1,
-                    "lag": abs(i - j),
-                    "corr_matrix_similarity": similarity_matrix[i, j],
-                }
-            )
-
-    lag_rows = []
-
-    for lag, value in lag_summary.items():
-        lag_rows.append(
-            {
-                "dataset_name": dataset_name,
-                "mouse_name": mouse_name,
-                "session_name": session_name,
-                "depth_type": depth_type,
-                "condition": condition,
-                "row_index": row_idx,
-                "lag": lag,
-                "corr_matrix_similarity": value,
-            }
-        )
-
-    plot_similarity_matrix(
-        similarity_matrix,
-        title=(
-            f"{dataset_name}\n"
-            f"{mouse_name}, {session_name}, {depth_type}\n"
-            f"Correlation-matrix drift, chunks={N_CHUNKS}"
-        ),
-        out_base=os.path.join(ROW_HEATMAP_DIR, session_base + "_matrix"),
-    )
-
-    print(
-        f"Row {row_idx} | dataset={dataset_name} | mouse={mouse_name} | "
-        f"session={session_name} | depth={depth_type} | condition={condition} | "
-        f"neurons={n_neurons} | mean_offdiag={mean_similarity_offdiag:.4f}"
-    )
-
-    return session_row, matrix_rows, lag_rows
+    return session_row, lag_rows
 
 
 # =============================================================================
-# AGGREGATION HELPERS
+# AGGREGATIONS & STATISTICAL COMPARISONS
 # =============================================================================
 
-def aggregate_mean_matrix_from_entries(df):
-    mat = np.full((N_CHUNKS, N_CHUNKS), np.nan)
+def run_dataset_aggregations(session_df, lag_df, metric_prefix):
+    prefix_dir = os.path.join(FIG_DIR, metric_prefix)
+    ensure_dir(prefix_dir)
 
-    for i in range(N_CHUNKS):
-        for j in range(N_CHUNKS):
-            sub = df[
-                (df["chunk_i"] == i + 1)
-                & (df["chunk_j"] == j + 1)
-                ]
+    def evaluate_and_plot_param(sub_df, group_col, param_col, dataset_title_tag, out_sub, palette, is_gray=False):
+        groups = sub_df[group_col].dropna().unique()
+        p_val = None
+        if len(groups) == 2:
+            g1, g2 = groups[0], groups[1]
+            v1 = sub_df[sub_df[group_col] == g1][param_col].dropna().values
+            v2 = sub_df[sub_df[group_col] == g2][param_col].dropna().values
+            if len(v1) >= 2 and len(v2) >= 2:
+                _, p_val = ttest_ind(v1, v2, equal_var=False)
 
-            if len(sub) > 0:
-                mat[i, j] = np.nanmean(sub["corr_matrix_similarity"].values)
-
-    return mat
-
-
-def run_learning_aggregation(matrix_df, lag_df):
-    learning_mask = (
-            matrix_df["dataset_name"].astype(str).str.lower().str.contains("learning")
-            | matrix_df["session_name"].astype(str).str.lower().str.contains("learning")
-    )
-
-    learning_matrix_df = matrix_df[learning_mask].copy()
-
-    if len(learning_matrix_df) == 0:
-        print("No learning rows found. Skipping learning aggregation.")
-        return
-
-    learning_lag_df = lag_df[
-        lag_df["row_index"].isin(learning_matrix_df["row_index"].unique())
-    ].copy()
-
-    mapping_df = build_learning_session_mapping_by_mouse(learning_matrix_df)
-
-    learning_matrix_df = learning_matrix_df.merge(
-        mapping_df[
-            [
-                "mouse_name",
-                "session_name",
-                "session_datetime",
-                "session_order",
-                "learning_session",
-            ]
-        ],
-        on=["mouse_name", "session_name"],
-        how="left",
-    )
-
-    learning_lag_df = learning_lag_df.merge(
-        mapping_df[
-            [
-                "mouse_name",
-                "session_name",
-                "session_datetime",
-                "session_order",
-                "learning_session",
-            ]
-        ],
-        on=["mouse_name", "session_name"],
-        how="left",
-    )
-
-    mapping_df.to_csv(
-        os.path.join(CSV_DIR, "learning_session_order_mapping_by_mouse.csv"),
-        index=False,
-    )
-
-    max_order = int(np.nanmax(mapping_df["session_order"].values))
-    ordered_sessions = [f"session_{i}" for i in range(1, max_order + 1)]
-
-    for ordered_session in ordered_sessions:
-        sub = learning_matrix_df[
-            learning_matrix_df["learning_session"] == ordered_session
-            ].copy()
-
-        if len(sub) == 0:
-            continue
-
-        mean_mat = aggregate_mean_matrix_from_entries(sub)
-
-        n_mice = sub["mouse_name"].nunique()
-        n_rows = sub["row_index"].nunique()
-
-        plot_similarity_matrix(
-            mean_mat,
-            title=(
-                f"Learning {ordered_session}\n"
-                f"mean correlation-matrix similarity | mice={n_mice}, rows={n_rows}"
-            ),
-            out_base=os.path.join(
-                LEARNING_DIR,
-                f"learning_{ordered_session}_mean_corr_matrix_similarity",
-            ),
+        plot_parameter_bar_comparison(
+            sub_df, group_col, param_col,
+            f"{dataset_title_tag}: {param_col.replace('_', ' ').title()}",
+            os.path.join(out_sub, f"{sanitize_filename(dataset_title_tag)}_{param_col}_barplot"),
+            p_val=p_val, palette_dict=palette, is_gray_scale=is_gray
+        )
+        run_group_statistical_comparison(
+            sub_df, group_col, param_col,
+            os.path.join(STATS_CSV_DIR, f"{metric_prefix}_{sanitize_filename(dataset_title_tag)}_{param_col}_stats.csv")
         )
 
-    plot_learning_lag_barplot(
-        learning_lag_df,
-        title="Learning: correlation-matrix similarity by session",
-        out_base=os.path.join(
-            LEARNING_DIR,
-            "learning_corr_matrix_lag_barplot",
-        ),
-        session_order=ordered_sessions,
-    )
+    # 1. Learning
+    learning_sub = session_df[session_df["dataset_name"].str.lower().str.contains("learning")].copy()
+    if len(learning_sub) > 0:
+        mapping_df = build_learning_session_mapping_by_mouse(learning_sub)
+        learning_sub = learning_sub.merge(mapping_df[["mouse_name", "session_name", "learning_session"]],
+                                          on=["mouse_name", "session_name"], how="left")
 
-    plot_learning_lag_curves(
-        learning_lag_df,
-        title="Learning: correlation-matrix similarity curves by session",
-        out_base=os.path.join(
-            LEARNING_DIR,
-            "learning_corr_matrix_lag_curves",
-        ),
-        session_order=ordered_sessions,
-    )
+        lag_learning = lag_df[lag_df["row_index"].isin(learning_sub["row_index"].unique())].copy()
+        lag_learning = lag_learning.merge(learning_sub[["row_index", "learning_session"]], on="row_index", how="inner")
 
-    learning_lag_df.to_csv(
-        os.path.join(CSV_DIR, "learning_corr_matrix_lag_summary_ordered_sessions.csv"),
-        index=False,
-    )
+        out_sub = os.path.join(prefix_dir, "learning")
+        ensure_dir(out_sub)
+        plot_lag_barplot_with_points(lag_learning, "learning_session", "Learning: Lag Bar Plot with Animal Points",
+                                     os.path.join(out_sub, "learning_lag_barplot"), is_gray_scale=True)
+        plot_regression_lines(learning_sub, lag_learning, "learning_session", "Learning: Animal & Mean Regressions",
+                              os.path.join(out_sub, "learning_regression_lines"), is_gray_scale=True)
 
-    print("Learning aggregation completed.")
+        for param in ["regression_slope", "regression_intercept"]:
+            evaluate_and_plot_param(learning_sub[learning_sub["learning_session"].isin(["session_1", "session_4"])],
+                                    "learning_session", param, "Learning_S1_vs_S4", out_sub, None, is_gray=True)
 
+        run_2way_anova_with_posthoc(lag_learning, "learning_session", "similarity", STATS_CSV_DIR,
+                                    f"{metric_prefix}_learning")
 
-def run_lt_rot_aggregation(matrix_df, lag_df):
-    ltrot_mask = (
-        matrix_df["dataset_name"]
-        .astype(str)
-        .str.lower()
-        .str.contains("lt_rot")
-    )
+    # 2. lt_rot (Explicitly processing BOTH lt_rot_lt and lt_rot_rot independently, restricting to deep & superficial)
+    for cond in ["lt_rot_lt", "lt_rot_rot"]:
+        cond_data = session_df[
+            (session_df["condition"] == cond) & (session_df["depth_type"].isin(["deep", "superficial"]))].copy()
+        if len(cond_data) > 0:
+            lag_cond = lag_df[lag_df["row_index"].isin(cond_data["row_index"].unique())].copy()
 
-    ltrot_matrix_df = matrix_df[ltrot_mask].copy()
+            out_sub = os.path.join(prefix_dir, cond)
+            ensure_dir(out_sub)
+            palette = {"deep": DEEP_COLOR, "superficial": SUPERFICIAL_COLOR}
 
-    if len(ltrot_matrix_df) == 0:
-        print("No lt_rot rows found. Skipping lt_rot aggregation.")
-        return
+            plot_lag_barplot_with_points(lag_cond[lag_cond["row_index"].isin(cond_data["row_index"])], "depth_type",
+                                         f"{cond.upper()}: Lag Bar Plot", os.path.join(out_sub, f"{cond}_lag_barplot"),
+                                         palette_dict=palette)
+            plot_regression_lines(cond_data, lag_cond, "depth_type", f"{cond.upper()}: Regressions",
+                                  os.path.join(out_sub, f"{cond}_regression_lines"), palette_dict=palette)
 
-    ltrot_matrix_df = ltrot_matrix_df[
-        ltrot_matrix_df["depth_type"].isin(["deep", "superficial"])
-        & ltrot_matrix_df["condition"].isin(["lt", "rot"])
-        ].copy()
+            for param in ["regression_slope", "regression_intercept"]:
+                evaluate_and_plot_param(cond_data, "depth_type", param, f"{cond}_deep_vs_sup", out_sub, palette)
 
-    ltrot_lag_df = lag_df[
-        lag_df["row_index"].isin(ltrot_matrix_df["row_index"].unique())
-        & lag_df["depth_type"].isin(["deep", "superficial"])
-        & lag_df["condition"].isin(["lt", "rot"])
-        ].copy()
+            run_2way_anova_with_posthoc(lag_cond, "depth_type", "similarity", STATS_CSV_DIR, f"{metric_prefix}_{cond}")
 
-    if len(ltrot_lag_df) == 0:
-        print("lt_rot rows found, but no lt/rot deep/superficial entries.")
-        return
+    # 3. Intervention (Excluding sessions containing 'combined', evaluating specific int_i and int_f numerical parameter values)
+    interv_sub = session_df[session_df["dataset_name"].str.lower().str.contains("intervention")].copy()
+    if len(interv_sub) > 0:
+        if "session_name" in interv_sub.columns:
+            interv_sub = interv_sub[~interv_sub["session_name"].astype(str).str.lower().str.contains("combined")].copy()
 
-    ltrot_matrix_df.to_csv(
-        os.path.join(CSV_DIR, "lt_rot_corr_matrix_entries_lt_rot_split.csv"),
-        index=False,
-    )
+        out_sub = os.path.join(prefix_dir, "intervention")
+        ensure_dir(out_sub)
 
-    ltrot_lag_df.to_csv(
-        os.path.join(CSV_DIR, "lt_rot_corr_matrix_lag_summary_lt_rot_split.csv"),
-        index=False,
-    )
+        if "int_i" in interv_sub.columns and interv_sub["int_i"].nunique() > 0:
+            interv_i_sub = interv_sub.copy()
+            interv_i_sub["int_i_str"] = interv_i_sub["int_i"].astype(str)
+            lag_interv_i = lag_df[lag_df["row_index"].isin(interv_i_sub["row_index"].unique())].copy()
+            lag_interv_i = lag_interv_i.merge(interv_i_sub[["row_index", "int_i_str"]], on="row_index", how="inner")
 
-    for condition in ["lt", "rot"]:
-        condition_matrix_df = ltrot_matrix_df[
-            ltrot_matrix_df["condition"] == condition
-            ].copy()
+            unique_i_vals = sorted(interv_i_sub["int_i_str"].dropna().unique())
+            palette_i = {val: plt.cm.tab10(i % 10) for i, val in enumerate(unique_i_vals)}
 
-        condition_lag_df = ltrot_lag_df[
-            ltrot_lag_df["condition"] == condition
-            ].copy()
+            plot_lag_barplot_with_points(lag_interv_i, "int_i_str",
+                                         "Intervention (int_i parameter values): Lag Bar Plot",
+                                         os.path.join(out_sub, "intervention_int_i_lag_barplot"),
+                                         palette_dict=palette_i)
+            plot_regression_lines(interv_i_sub, lag_interv_i, "int_i_str",
+                                  "Intervention (int_i parameter values): Regressions",
+                                  os.path.join(out_sub, "intervention_int_i_regression_lines"), palette_dict=palette_i)
+            run_2way_anova_with_posthoc(lag_interv_i, "int_i_str", "similarity", STATS_CSV_DIR,
+                                        f"{metric_prefix}_intervention_int_i")
 
-        if len(condition_matrix_df) == 0:
-            continue
+        if "int_f" in interv_sub.columns and interv_sub["int_f"].nunique() > 0:
+            interv_f_sub = interv_sub.copy()
+            interv_f_sub["int_f_str"] = interv_f_sub["int_f"].astype(str)
+            lag_interv_f = lag_df[lag_df["row_index"].isin(interv_f_sub["row_index"].unique())].copy()
+            lag_interv_f = lag_interv_f.merge(interv_f_sub[["row_index", "int_f_str"]], on="row_index", how="inner")
 
-        for depth in ["deep", "superficial"]:
-            sub = condition_matrix_df[
-                condition_matrix_df["depth_type"] == depth
-                ].copy()
+            unique_f_vals = sorted(interv_f_sub["int_f_str"].dropna().unique())
+            palette_f = {val: plt.cm.Set2(i % 8) for i, val in enumerate(unique_f_vals)}
 
-            if len(sub) == 0:
-                continue
+            plot_lag_barplot_with_points(lag_interv_f, "int_f_str",
+                                         "Intervention (int_f parameter values): Lag Bar Plot",
+                                         os.path.join(out_sub, "intervention_int_f_lag_barplot"),
+                                         palette_dict=palette_f)
+            plot_regression_lines(interv_f_sub, lag_interv_f, "int_f_str",
+                                  "Intervention (int_f parameter values): Regressions",
+                                  os.path.join(out_sub, "intervention_int_f_regression_lines"), palette_dict=palette_f)
+            run_2way_anova_with_posthoc(lag_interv_f, "int_f_str", "similarity", STATS_CSV_DIR,
+                                        f"{metric_prefix}_intervention_int_f")
 
-            mean_mat = aggregate_mean_matrix_from_entries(sub)
+    # 4. dreadds, dreads, egrin, lt_ephys_mice
+    for ds_kw in ["dreadds", "dreads", "egrin", "lt_ephys_mice"]:
+        ds_sub = session_df[session_df["dataset_name"].str.lower().str.contains(ds_kw)].copy()
+        if len(ds_sub) > 0:
+            lag_ds = lag_df[lag_df["row_index"].isin(ds_sub["row_index"].unique())].copy()
 
-            n_mice = sub["mouse_name"].nunique()
-            n_rows = sub["row_index"].nunique()
+            out_sub = os.path.join(prefix_dir, ds_kw)
+            ensure_dir(out_sub)
+            palette = {"deep": DEEP_COLOR, "superficial": SUPERFICIAL_COLOR, "whole_population": WHOLE_POP_COLOR}
 
-            plot_similarity_matrix(
-                mean_mat,
-                title=(
-                    f"lt_rot {condition}, {depth}\n"
-                    f"mean correlation-matrix similarity | mice={n_mice}, rows={n_rows}"
-                ),
-                out_base=os.path.join(
-                    LT_ROT_DIR,
-                    f"lt_rot_{condition}_{depth}_mean_corr_matrix_similarity",
-                ),
-            )
+            plot_lag_barplot_with_points(lag_ds, "depth_type", f"{ds_kw}: Lag Bar Plot",
+                                         os.path.join(out_sub, f"{ds_kw}_lag_barplot"), palette_dict=palette)
+            plot_regression_lines(ds_sub, lag_ds, "depth_type", f"{ds_kw}: Regressions",
+                                  os.path.join(out_sub, f"{ds_kw}_regression_lines"), palette_dict=palette)
 
-        plot_deep_sup_lag_barplot(
-            condition_lag_df,
-            title=f"lt_rot {condition}: correlation-matrix similarity deep vs superficial",
-            out_base=os.path.join(
-                LT_ROT_DIR,
-                f"lt_rot_{condition}_deep_vs_superficial_corr_matrix_lag_barplot",
-            ),
-        )
+            sub_ds_depths = ds_sub[ds_sub["depth_type"].isin(["deep", "superficial"])]
+            for param in ["regression_slope", "regression_intercept"]:
+                evaluate_and_plot_param(sub_ds_depths, "depth_type", param, f"{ds_kw}_deep_vs_sup", out_sub, palette)
 
-        plot_deep_sup_lag_curves(
-            condition_lag_df,
-            title=f"lt_rot {condition}: correlation-matrix similarity deep vs superficial curves",
-            out_base=os.path.join(
-                LT_ROT_DIR,
-                f"lt_rot_{condition}_deep_vs_superficial_corr_matrix_lag_curves",
-            ),
-        )
-
-    print("lt_rot aggregation completed.")
-
-
-def run_named_dataset_deep_sup_aggregation(matrix_df, lag_df, dataset_keyword, output_subdir_name):
-    out_dir = os.path.join(FIG_DIR, output_subdir_name)
-    ensure_dir(out_dir)
-
-    dataset_mask = (
-        matrix_df["dataset_name"]
-        .astype(str)
-        .str.lower()
-        .str.contains(dataset_keyword.lower())
-    )
-
-    dataset_matrix_df = matrix_df[dataset_mask].copy()
-
-    if len(dataset_matrix_df) == 0:
-        print(f"No {dataset_keyword} rows found. Skipping.")
-        return
-
-    dataset_matrix_df = dataset_matrix_df[
-        dataset_matrix_df["depth_type"].isin(["deep", "superficial"])
-    ].copy()
-
-    dataset_lag_df = lag_df[
-        lag_df["row_index"].isin(dataset_matrix_df["row_index"].unique())
-        & lag_df["depth_type"].isin(["deep", "superficial"])
-        ].copy()
-
-    if len(dataset_lag_df) == 0:
-        print(f"{dataset_keyword} rows found, but no deep/superficial entries.")
-        return
-
-    conditions = sorted(dataset_matrix_df["condition"].dropna().unique())
-
-    for condition in conditions:
-        condition_matrix_df = dataset_matrix_df[
-            dataset_matrix_df["condition"] == condition
-            ].copy()
-
-        condition_lag_df = dataset_lag_df[
-            dataset_lag_df["condition"] == condition
-            ].copy()
-
-        if len(condition_matrix_df) == 0:
-            continue
-
-        for depth in ["deep", "superficial"]:
-            sub = condition_matrix_df[
-                condition_matrix_df["depth_type"] == depth
-                ].copy()
-
-            if len(sub) == 0:
-                continue
-
-            mean_mat = aggregate_mean_matrix_from_entries(sub)
-
-            n_mice = sub["mouse_name"].nunique()
-            n_rows = sub["row_index"].nunique()
-
-            plot_similarity_matrix(
-                mean_mat,
-                title=(
-                    f"{output_subdir_name} {condition}, {depth}\n"
-                    f"mean correlation-matrix similarity | mice={n_mice}, rows={n_rows}"
-                ),
-                out_base=os.path.join(
-                    out_dir,
-                    f"{output_subdir_name}_{sanitize_filename(condition)}_{depth}_mean_corr_matrix_similarity",
-                ),
-            )
-
-        plot_deep_sup_lag_barplot(
-            condition_lag_df,
-            title=f"{output_subdir_name} {condition}: correlation-matrix similarity deep vs superficial",
-            out_base=os.path.join(
-                out_dir,
-                f"{output_subdir_name}_{sanitize_filename(condition)}_deep_vs_superficial_corr_matrix_lag_barplot",
-            ),
-        )
-
-        plot_deep_sup_lag_curves(
-            condition_lag_df,
-            title=f"{output_subdir_name} {condition}: correlation-matrix similarity deep vs superficial curves",
-            out_base=os.path.join(
-                out_dir,
-                f"{output_subdir_name}_{sanitize_filename(condition)}_deep_vs_superficial_corr_matrix_lag_curves",
-            ),
-        )
-
-    print(f"{dataset_keyword} aggregation completed.")
-
-
-def run_all_deep_sup_aggregation(matrix_df, lag_df):
-    non_learning_mask = ~(
-            matrix_df["dataset_name"].astype(str).str.lower().str.contains("learning")
-            | matrix_df["session_name"].astype(str).str.lower().str.contains("learning")
-    )
-
-    ds_matrix_df = matrix_df[
-        non_learning_mask
-        & matrix_df["depth_type"].isin(["deep", "superficial"])
-        ].copy()
-
-    if len(ds_matrix_df) == 0:
-        print("No non-learning deep/superficial rows found.")
-        return
-
-    ds_lag_df = lag_df[
-        lag_df["row_index"].isin(ds_matrix_df["row_index"].unique())
-        & lag_df["depth_type"].isin(["deep", "superficial"])
-        ].copy()
-
-    groups = (
-        ds_matrix_df[["dataset_name", "condition"]]
-        .drop_duplicates()
-        .sort_values(["dataset_name", "condition"])
-    )
-
-    for _, group_row in groups.iterrows():
-        dataset_name = group_row["dataset_name"]
-        condition = group_row["condition"]
-
-        group_matrix_df = ds_matrix_df[
-            (ds_matrix_df["dataset_name"] == dataset_name)
-            & (ds_matrix_df["condition"] == condition)
-            ]
-
-        group_lag_df = ds_lag_df[
-            (ds_lag_df["dataset_name"] == dataset_name)
-            & (ds_lag_df["condition"] == condition)
-            ]
-
-        for depth in ["deep", "superficial"]:
-            sub = group_matrix_df[
-                group_matrix_df["depth_type"] == depth
-                ]
-
-            if len(sub) == 0:
-                continue
-
-            mean_mat = aggregate_mean_matrix_from_entries(sub)
-
-            plot_similarity_matrix(
-                mean_mat,
-                title=f"{dataset_name} {condition}, {depth}",
-                out_base=os.path.join(
-                    DEEP_SUP_DIR,
-                    f"{sanitize_filename(dataset_name)}_{sanitize_filename(condition)}_{depth}_mean_corr_matrix_similarity",
-                ),
-            )
-
-        plot_deep_sup_lag_barplot(
-            group_lag_df,
-            title=f"{dataset_name} {condition}: correlation-matrix similarity deep vs superficial",
-            out_base=os.path.join(
-                DEEP_SUP_DIR,
-                f"{sanitize_filename(dataset_name)}_{sanitize_filename(condition)}_deep_vs_superficial_corr_matrix_lag_barplot",
-            ),
-        )
-
-        plot_deep_sup_lag_curves(
-            group_lag_df,
-            title=f"{dataset_name} {condition}: correlation-matrix similarity deep vs superficial curves",
-            out_base=os.path.join(
-                DEEP_SUP_DIR,
-                f"{sanitize_filename(dataset_name)}_{sanitize_filename(condition)}_deep_vs_superficial_corr_matrix_lag_curves",
-            ),
-        )
-
-    print("All deep/superficial aggregation completed.")
+            run_2way_anova_with_posthoc(lag_ds, "depth_type", "similarity", STATS_CSV_DIR, f"{metric_prefix}_{ds_kw}")
 
 
 # =============================================================================
-# MAIN
+# MAIN PIPELINE
 # =============================================================================
 
-def main():
-    ensure_all_dirs()
-
-    if not os.path.isfile(CSV_PATH):
-        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+def run_pipeline(analysis_type="cormat"):
+    prefixes = {
+        "cormat": "CorrMatrix_Drift",
+        "pv_elementwise": "PV_Elementwise_Drift",
+        "rsa": "RSA_Drift",
+        "procrustes": "Procrustes_Drift"
+    }
+    prefix = prefixes[analysis_type]
+    print(f"\n==============================================================")
+    print(f"Running Analysis: {prefix}")
+    print(f"==============================================================")
 
     df = pd.read_csv(CSV_PATH)
-
-    required_cols = [
-        "dataset_name",
-        "mouse_name",
-        "session_name",
-        "depth_type",
-        "standardized_file_path",
-    ]
-
-    for col in required_cols:
-        if col not in df.columns:
-            raise KeyError(f"Missing required column '{col}' in master dataset CSV.")
-
-    if DATASET_FILTER is not None:
-        df = df[df["dataset_name"].isin(DATASET_FILTER)].copy()
-
-    if not PROCESS_WHOLE_POPULATION:
-        df = df[
-            ~df["depth_type"].astype(str).str.lower().str.contains("whole")
-        ].copy()
-
-    df = df.reset_index(drop=True)
-
     if MAX_ROWS is not None:
         df = df.iloc[:MAX_ROWS].copy()
 
-    init_csv(SESSION_CSV, SESSION_COLUMNS)
-    init_csv(MATRIX_ENTRIES_CSV, MATRIX_COLUMNS)
-    init_csv(LAG_CSV, LAG_COLUMNS)
-    init_csv(FAILED_ROWS_CSV, FAILED_COLUMNS)
+    session_rows, lag_rows = [], []
 
-    log_path = os.path.join(LOG_DIR, "corr_matrix_drift_analysis_log.txt")
-    log_file = open(log_path, "w", encoding="utf-8")
+    for row_idx, row in df.iterrows():
+        try:
+            s_row, l_rows = process_row(row_idx, row, analysis_type=analysis_type)
+            session_rows.append(s_row)
+            lag_rows.extend(l_rows)
+        except Exception:
+            continue
 
+    session_df = pd.DataFrame(session_rows)
+    lag_df = pd.DataFrame(lag_rows)
+
+    if len(session_df) > 0:
+        run_dataset_aggregations(session_df, lag_df, metric_prefix=prefix)
+        session_df.to_csv(os.path.join(CSV_DIR, f"{prefix}_session_summary.csv"), index=False)
+        lag_df.to_csv(os.path.join(CSV_DIR, f"{prefix}_lag_summary.csv"), index=False)
+
+
+def main():
+    ensure_all_dirs()
+    if not os.path.isfile(CSV_PATH):
+        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+    log_file = open(os.path.join(LOG_DIR, "comprehensive_drift_analysis_log.txt"), "w", encoding="utf-8")
     original_stdout = os.sys.stdout
     os.sys.stdout = Tee(original_stdout, log_file)
 
-    print("==============================================================")
-    print("Correlation-Matrix Drift Analysis")
-    print(f"Started: {datetime.now():%Y-%m-%d %H:%M}")
-    print("==============================================================")
-    print(f"Input CSV: {CSV_PATH}")
-    print(f"Rows to process: {len(df)}")
-    print(f"Output dir: {OUTPUT_DIR}")
-    print(f"N chunks: {N_CHUNKS}")
-    print(f"Remove mov_dir == 0: {REMOVE_MOV_DIR_ZERO}")
-    print(f"Z-score cells: {ZSCORE_CELLS}")
-    print(f"Correlation method: {CORR_METHOD}")
-    print(f"Matrix similarity metric: {MATRIX_SIMILARITY_METRIC}")
-    print(f"Clip negative similarity: {CLIP_NEGATIVE_SIMILARITY_IN_RESULTS}")
-    print(f"Exclude lag 0 in plots: {EXCLUDE_ZERO_LAG_IN_PLOTS}")
-    print("")
-
-    ok_count = 0
-    fail_count = 0
-    global_time = timeit.default_timer()
-
-    for row_idx, row in df.iterrows():
-        local_time = timeit.default_timer()
-
-        try:
-            session_row, matrix_rows, lag_rows = process_row(row_idx, row)
-
-            append_csv_row(SESSION_CSV, SESSION_COLUMNS, session_row)
-            append_many_csv_rows(MATRIX_ENTRIES_CSV, MATRIX_COLUMNS, matrix_rows)
-            append_many_csv_rows(LAG_CSV, LAG_COLUMNS, lag_rows)
-
-            ok_count += 1
-
-            elapsed = timeit.default_timer() - local_time
-            print(f"[OK] Row {row_idx} finished in {elapsed:.2f} s\n")
-
-        except Exception as e:
-            fail_count += 1
-
-            failed_row = {
-                "row_index": row_idx,
-                "dataset_name": row.get("dataset_name", ""),
-                "mouse_name": row.get("mouse_name", ""),
-                "session_name": row.get("session_name", ""),
-                "depth_type": row.get("depth_type", ""),
-                "standardized_file_path": row.get("standardized_file_path", ""),
-                "error": str(e),
-            }
-
-            append_csv_row(FAILED_ROWS_CSV, FAILED_COLUMNS, failed_row)
-
-            print(f"[ERROR] Row {row_idx}: {e}\n")
+    # Run all 4 methods: C-Matrix Drift, Elementwise PV, RSA, and Procrustes Manifold Shape Matching
+    run_pipeline(analysis_type="cormat")
+    run_pipeline(analysis_type="pv_elementwise")
+    run_pipeline(analysis_type="rsa")
+    run_pipeline(analysis_type="procrustes")
 
     print("==============================================================")
-    print("Running aggregations")
-    print("==============================================================")
-
-    matrix_df = pd.read_csv(MATRIX_ENTRIES_CSV)
-    lag_df = pd.read_csv(LAG_CSV)
-
-    if len(matrix_df) > 0:
-        run_learning_aggregation(matrix_df, lag_df)
-        run_lt_rot_aggregation(matrix_df, lag_df)
-
-        run_named_dataset_deep_sup_aggregation(
-            matrix_df,
-            lag_df,
-            dataset_keyword="dreadds",
-            output_subdir_name="dreadds",
-        )
-
-        run_named_dataset_deep_sup_aggregation(
-            matrix_df,
-            lag_df,
-            dataset_keyword="dreads",
-            output_subdir_name="dreads",
-        )
-
-        run_named_dataset_deep_sup_aggregation(
-            matrix_df,
-            lag_df,
-            dataset_keyword="egrin",
-            output_subdir_name="egrin",
-        )
-
-        run_all_deep_sup_aggregation(matrix_df, lag_df)
-
-    else:
-        print("No matrix entries were generated. Skipping aggregations.")
-
-    total_elapsed = timeit.default_timer() - global_time
-
-    print("==============================================================")
-    print("Done")
-    print(f"Finished: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"Successful entries: {ok_count}")
-    print(f"Failed entries: {fail_count}")
-    print(f"Total elapsed time: {total_elapsed:.2f} s")
-    print(f"Results saved in: {OUTPUT_DIR}")
+    print(f"All analyses completed successfully. Results saved in: {OUTPUT_DIR}")
     print("==============================================================")
 
     os.sys.stdout = original_stdout

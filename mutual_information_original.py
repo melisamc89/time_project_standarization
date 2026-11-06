@@ -2,80 +2,102 @@
 # -*- coding: utf-8 -*-
 
 """
-Mutual Information analysis pipeline for standardized datasets.
-
-What this script does
----------------------
-1) Reads the master standardized dataset index CSV.
-2) Loads each standardized session pickle.
-3) Computes per-neuron mutual information with:
-       - position
-       - position_x_direction
-       - speed
-       - time
-       - inner_time
-       - direction
-       - trial_id
-4) Saves:
-       - one CSV with one row per neuron across all datasets/sessions
-       - one CSV with one row per session summarizing mean/std MI
-       - one pickle per session with full MI arrays
-       - one log txt file
-
-Assumptions
------------
-- signal is shaped: (n_timepoints, n_neurons)
-- pos may be:
-      * 1D: (n_timepoints,)
-      * 2D: (n_timepoints, d)
-  In this script, "position" is defined as the first coordinate: pos[:, 0]
-- "position_x_direction" = position_1d * mov_dir
-- mutual_info_regression is used as in the previous code base
+Comprehensive Intra-Dataset Clustering, Refined Time/Position/Direction Assignment,
+Animal-Level Cell Counts, Two-Way ANOVA on Information Values with Post-Hoc Tests,
+Error Bars & Dots Plotting, Text Reports, and Dual PNG/SVG Export Pipeline.
 """
 
 import os
-import csv
+import re
+import json
 import pickle
-import timeit
-from datetime import datetime
+import itertools
+import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_selection import mutual_info_regression
+import matplotlib.pyplot as plt
+import seaborn as sns
 
+from scipy.stats import zscore, ttest_ind, chi2_contingency, chisquare
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from openTSNE import TSNE
 
-# =============================================================================
-# Paths
-# =============================================================================
-
-CSV_PATH = "/home/melisamc/Documents/time_project_standarization/data/metadata/master_dataset_index.csv"
-
-OUTPUT_DIR = "/home/melisamc/Documents/time_project_standarization/analysis/mutual_information"
-SESSION_PKL_DIR = os.path.join(OUTPUT_DIR, "session_pickles")
-LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
-
-NEURON_MI_CSV = os.path.join(OUTPUT_DIR, "mutual_information_per_neuron.csv")
-SESSION_MI_CSV = os.path.join(OUTPUT_DIR, "mutual_information_per_session_summary.csv")
-
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 # =============================================================================
-# Parameters
+# Paths & Settings
 # =============================================================================
 
-MAX_ROWS = None                # set to integer for testing
-MI_N_NEIGHBORS = 50
-MI_RANDOM_STATE = 16
-VERBOSE = True
+PROJECT_ROOT = "/home/hippolab/Documents/melisa/time_project_standarization"
 
-BEHAVIOR_LABELS = [
-    "position",
-    "position_x_direction",
-    "speed",
-    "time",
-    "inner_time",
-    "direction",
-    "trial_id",
+MI_CSV = os.path.join(PROJECT_ROOT, "analysis", "mutual_information_behavior_and_lfp",
+                      "mutual_information_per_neuron.csv")
+MASTER_INDEX_CSV = os.path.join(PROJECT_ROOT, "data", "metadata", "master_dataset_index.csv")
+
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "analysis", "mir_comprehensive_twoway_anova")
+
+MIR_FEATURE_COLUMNS = [
+    "mi_position",
+    "mi_position_x_direction",
+    "mi_direction",
+    "mi_speed",
+    "mi_time",
+    "mi_inner_time",
+    "mi_trial_id",
 ]
+
+MIR_FEATURE_TITLES = [
+    "PositionMIR",
+    "DirPositionMIR",
+    "MovDirMIR",
+    "SpeedMIR",
+    "TimeMIR",
+    "InnerTimeMIR",
+    "TrialIDMIR",
+]
+
+N_CLUSTERS = 3
+UNASSIGNED_LABEL = 10
+KMEANS_RANDOM_STATE = 42
+KMEANS_N_INIT = 50
+
+TSNE_PERPLEXITY = 50
+TSNE_RANDOM_STATE = 42
+TSNE_N_JOBS = 8
+TSNE_INITIALIZATION = "pca"
+TSNE_METRIC = "euclidean"
+
+SCATTER_SIZE = 40
+FEATURE_CMAP = "coolwarm"
+MOUSE_CMAP = "rainbow"
+
+MIR_VMIN_Z = -1.0
+MIR_VMAX_Z = 3.5
+
+CLUSTER_COLOR_MAP = {
+    2: "#ec8ef8ff",  # Position
+    1: "#66cef4ff",  # Direction
+    0: "#bce784ff",  # Time
+    10: "#bbbcc0ff",  # Unassigned
+}
+
+CLUSTER_COLOR_MAP_STR = {
+    "2": "#ec8ef8ff",
+    "1": "#66cef4ff",
+    "0": "#bce784ff",
+    "10": "#bbbcc0ff",
+}
+
+CLUSTER_NAME_MAP_STR = {
+    "0": "Time",
+    "1": "Direction",
+    "2": "Position",
+    "10": "Unassigned",
+}
 
 
 # =============================================================================
@@ -84,39 +106,6 @@ BEHAVIOR_LABELS = [
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
-
-
-def load_pickle_standard(file_path):
-    with open(file_path, "rb") as f:
-        return pickle.load(f)
-
-
-def save_pickle_standard(file_path, obj):
-    with open(file_path, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def ensure_1d(x):
-    x = np.asarray(x)
-    if x.ndim == 2 and x.shape[1] == 1:
-        x = x[:, 0]
-    return x.reshape(-1)
-
-
-def ensure_2d(x):
-    x = np.asarray(x)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    return x
-
-
-def get_pos_1d(pos):
-    pos = np.asarray(pos)
-    if pos.ndim == 1:
-        return pos.reshape(-1)
-    if pos.ndim == 2:
-        return pos[:, 0].reshape(-1)
-    raise ValueError(f"Unexpected pos shape: {pos.shape}")
 
 
 def sanitize_for_filename(text):
@@ -130,449 +119,322 @@ def sanitize_for_filename(text):
     return "".join(safe)
 
 
-def base_name_from_row(row_idx, row):
-    return (
-        f"row_{row_idx:04d}_"
-        f"{sanitize_for_filename(row.get('dataset_name', 'unknown_dataset'))}_"
-        f"{sanitize_for_filename(row.get('mouse_name', 'unknown_mouse'))}_"
-        f"{sanitize_for_filename(row.get('session_name', 'unknown_session'))}_"
-        f"{sanitize_for_filename(row.get('depth_type', 'unknown_depth'))}"
+def save_figure_both(fig, png_dir, svg_dir, out_base):
+    ensure_dir(png_dir)
+    ensure_dir(svg_dir)
+    png_path = os.path.join(png_dir, out_base + ".png")
+    svg_path = os.path.join(svg_dir, out_base + ".svg")
+    fig.savefig(png_path, dpi=400, bbox_inches="tight")
+    fig.savefig(svg_path, dpi=400, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved: {png_path}")
+    print(f"[OK] Saved: {svg_path}")
+
+
+def save_text_file(stats_dir, out_base, text):
+    ensure_dir(stats_dir)
+    out_path = os.path.join(stats_dir, out_base + ".txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"[OK] Saved: {out_path}")
+
+
+def rowwise_zscore(X):
+    Xz = zscore(X, axis=1, nan_policy="omit")
+    Xz = np.where(np.isfinite(Xz), Xz, 0.0)
+    return Xz
+
+
+def build_mouse_index(df):
+    mice_sorted = sorted(df["mouse_name"].dropna().astype(str).unique().tolist())
+    mouse_to_idx = {m: i for i, m in enumerate(mice_sorted)}
+    out = df.copy()
+    out["mouse_index"] = out["mouse_name"].astype(str).map(mouse_to_idx)
+    return out, mice_sorted
+
+
+# =============================================================================
+# Refined Semantic Mapping & Clustering
+# =============================================================================
+
+def infer_intra_dataset_semantic_mapping(df_dataset, raw_labels):
+    """
+    Time cluster: higher info in trial_id and time simultaneously,
+                  lower info in position, direction, and position_x_direction.
+    Position cluster: higher info in position.
+    Direction cluster: remaining.
+    """
+    tmp = df_dataset.copy()
+    tmp["raw_label"] = raw_labels
+
+    cluster_ids = sorted(tmp["raw_label"].unique().tolist())
+    if len(cluster_ids) < N_CLUSTERS:
+        return {cid: cid for cid in cluster_ids}
+
+    scores = {}
+    for cid in cluster_ids:
+        sub = tmp[tmp["raw_label"] == cid]
+        pos = sub["mi_position"].mean()
+        time = sub["mi_time"].mean()
+        trial = sub["mi_trial_id"].mean()
+        dir_val = sub["mi_direction"].mean()
+        pos_dir = sub["mi_position_x_direction"].mean() if "mi_position_x_direction" in sub.columns else 0.0
+
+        # Time score definition
+        time_score = (time + trial) - (pos + dir_val + pos_dir)
+        # Position score definition
+        pos_score = pos - (time + trial)
+
+        scores[cid] = {"time_score": time_score, "pos_score": pos_score, "pos": pos}
+
+    # 1. Time cluster has highest time_score
+    time_cid = max(cluster_ids, key=lambda c: scores[c]["time_score"])
+
+    # 2. Position cluster has highest pos among remaining
+    remaining_after_time = [c for c in cluster_ids if c != time_cid]
+    pos_cid = max(remaining_after_time, key=lambda c: scores[c]["pos"]) if remaining_after_time else time_cid
+
+    # 3. Direction gets the final remaining cluster
+    remaining_after_pos = [c for c in remaining_after_time if c != pos_cid]
+    dir_cid = remaining_after_pos[0] if remaining_after_pos else (
+        remaining_after_time[0] if remaining_after_time else time_cid)
+
+    return {
+        pos_cid: 2,  # Position
+        time_cid: 0,  # Time
+        dir_cid: 1,  # Direction
+    }
+
+
+def cluster_single_dataset(df_dataset):
+    X_raw = df_dataset[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
+    valid_mask = np.all(np.isfinite(X_raw), axis=1)
+    df_sub = df_dataset.loc[valid_mask].copy().reset_index(drop=True)
+    X_raw = X_raw[valid_mask]
+
+    if len(df_sub) < N_CLUSTERS:
+        raise ValueError("Too few valid neurons for clustering.")
+
+    X_z = rowwise_zscore(X_raw)
+    z_cols = [f"z_{c}" for c in MIR_FEATURE_COLUMNS]
+    for j, col in enumerate(z_cols):
+        df_sub[col] = X_z[:, j]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_z)
+
+    kmeans = KMeans(
+        n_clusters=N_CLUSTERS,
+        random_state=KMEANS_RANDOM_STATE,
+        n_init=KMEANS_N_INIT,
     )
+    raw_labels = kmeans.fit_predict(X_scaled)
 
+    remap_dict = infer_intra_dataset_semantic_mapping(df_sub, raw_labels)
+    semantic_labels = np.array([remap_dict.get(int(l), UNASSIGNED_LABEL) for l in raw_labels], dtype=int)
 
-def infer_recording_type(row):
-    """
-    Returns 'calcium', 'ephys', or 'unknown'.
+    tsne = TSNE(
+        n_components=2,
+        perplexity=min(TSNE_PERPLEXITY, max(5, len(df_sub) // 3)),
+        initialization=TSNE_INITIALIZATION,
+        metric=TSNE_METRIC,
+        n_jobs=TSNE_N_JOBS,
+        random_state=TSNE_RANDOM_STATE,
+        verbose=False,
+    )
+    embedding = np.asarray(tsne.fit(X_scaled))
 
-    Priority:
-    1) explicit columns if present
-    2) infer from dataset_name / file path
-    """
-    candidate_columns = [
-        "recording_type",
-        "modality",
-        "signal_type",
-        "dataset_type",
-        "data_type",
-    ]
-    for col in candidate_columns:
-        if col in row and pd.notna(row[col]):
-            value = str(row[col]).strip().lower()
-            if "calcium" in value:
-                return "calcium"
-            if "ephys" in value or "electro" in value:
-                return "ephys"
+    df_sub["cluster_initial"] = raw_labels
+    df_sub["cluster_id"] = semantic_labels
+    df_sub["tsne_1"] = embedding[:, 0]
+    df_sub["tsne_2"] = embedding[:, 1]
 
-    text_to_search = " ".join([
-        str(row.get("dataset_name", "")),
-        str(row.get("standardized_file_path", "")),
-    ]).lower()
-
-    if any(k in text_to_search for k in ["calcium", "caim", "dff", "trace"]):
-        return "calcium"
-    if any(k in text_to_search for k in ["ephys", "lfp", "spike", "electro"]):
-        return "ephys"
-
-    return "unknown"
-
-
-def validate_lengths(signal, behavior_dict, row_idx):
-    n_time = signal.shape[0]
-    for key, value in behavior_dict.items():
-        if value is None:
-            continue
-        if len(value) != n_time:
-            raise ValueError(
-                f"Row {row_idx}: length mismatch for '{key}' "
-                f"({len(value)} vs {n_time})"
-            )
-
-
-def compute_single_feature_mi(feature_1d, signal_2d, n_neighbors=50, random_state=16):
-    """
-    Compute MI(feature -> neuron signal) for all neurons independently.
-
-    feature_1d : shape (n_time,)
-    signal_2d  : shape (n_time, n_neurons)
-
-    Returns
-    -------
-    mi_values : shape (n_neurons,)
-    """
-    x = ensure_1d(feature_1d).reshape(-1, 1)
-    signal_2d = ensure_2d(signal_2d)
-
-    n_neurons = signal_2d.shape[1]
-    mi_values = np.full(n_neurons, np.nan, dtype=float)
-
-    for neuron_idx in range(n_neurons):
-        y = signal_2d[:, neuron_idx]
-        mi = mutual_info_regression(
-            x,
-            y,
-            n_neighbors=n_neighbors,
-            random_state=random_state,
-        )
-        mi_values[neuron_idx] = mi[0]
-
-    return mi_values
-
-
-def build_behavior_features(data):
-    """
-    Create the behavioral variables used for MI.
-    """
-    signal = ensure_2d(data["signal"])
-    pos_1d = ensure_1d(get_pos_1d(data["pos"]))
-    mov_dir = ensure_1d(data["mov_dir"])
-    time_1d = ensure_1d(data["time"])
-
-    speed = ensure_1d(data["speed"]) if data.get("speed", None) is not None else None
-    inner_time = ensure_1d(data["inner_time"]) if data.get("inner_time", None) is not None else None
-    trial_id = ensure_1d(data["trial_id"]) if data.get("trial_id", None) is not None else None
-
-    position_x_direction = pos_1d * mov_dir
-
-    behavior_dict = {
-        "position": pos_1d,
-        "position_x_direction": position_x_direction,
-        "speed": speed,
-        "time": time_1d,
-        "inner_time": inner_time,
-        "direction": mov_dir,
-        "trial_id": trial_id,
-    }
-
-    validate_lengths(signal, behavior_dict, row_idx="unknown")
-
-    return signal, behavior_dict
-
-
-def compute_mi_for_session(data):
-    """
-    Returns
-    -------
-    mi_dict : dict
-        keys are behavior names, values are arrays of shape (n_neurons,)
-    """
-    signal, behavior_dict = build_behavior_features(data)
-
-    mi_dict = {}
-    for label in BEHAVIOR_LABELS:
-        feature = behavior_dict[label]
-        if feature is None:
-            mi_dict[label] = None
-        else:
-            mi_dict[label] = compute_single_feature_mi(
-                feature_1d=feature,
-                signal_2d=signal,
-                n_neighbors=MI_N_NEIGHBORS,
-                random_state=MI_RANDOM_STATE,
-            )
-    return mi_dict, signal.shape[0], signal.shape[1]
+    return df_sub
 
 
 # =============================================================================
-# CSV schemas
+# Statistical Analyses & Plotting with Error Bars, Dots, and Two-Way ANOVA
 # =============================================================================
 
-NEURON_MI_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "recording_type",
-    "standardized_file_path",
-    "row_index",
-    "neuron_index",
-    "n_timepoints",
-    "n_neurons_in_session",
-    "mi_position",
-    "mi_position_x_direction",
-    "mi_speed",
-    "mi_time",
-    "mi_inner_time",
-    "mi_direction",
-    "mi_trial_id",
-]
+def analyze_and_plot_subset(df_clustered, sub_png_dir, sub_svg_dir, sub_stats_dir, prefix):
+    # 1. Embedding Grid Plot
+    feature_cols = [f"z_{c}" for c in MIR_FEATURE_COLUMNS]
+    df_plot, _ = build_mouse_index(df_clustered)
 
-SESSION_MI_COLUMNS = [
-    "dataset_name",
-    "mouse_name",
-    "session_name",
-    "depth_type",
-    "recording_type",
-    "standardized_file_path",
-    "row_index",
-    "n_timepoints",
-    "n_neurons",
-    "mi_position_mean",
-    "mi_position_std",
-    "mi_position_x_direction_mean",
-    "mi_position_x_direction_std",
-    "mi_speed_mean",
-    "mi_speed_std",
-    "mi_time_mean",
-    "mi_time_std",
-    "mi_inner_time_mean",
-    "mi_inner_time_std",
-    "mi_direction_mean",
-    "mi_direction_std",
-    "mi_trial_id_mean",
-    "mi_trial_id_std",
-    "session_pickle_name",
-    "session_pickle_path",
-]
+    fig, axs = plt.subplots(3, 3, figsize=(12, 10))
+    axs = axs.ravel()
+    sns.scatterplot(data=df_plot, x="tsne_1", y="tsne_2", hue="cluster_id", palette=CLUSTER_COLOR_MAP, ax=axs[0],
+                    legend=False, s=SCATTER_SIZE)
+    axs[0].set_title("tSNE by Cluster ID")
+    sns.scatterplot(data=df_plot, x="tsne_1", y="tsne_2", hue="mouse_index", palette=MOUSE_CMAP, ax=axs[1],
+                    legend=False, s=SCATTER_SIZE)
+    axs[1].set_title("tSNE by Mouse ID")
 
+    for i in range(7):
+        sc = axs[i + 2].scatter(df_plot["tsne_1"], df_plot["tsne_2"], c=df_plot[feature_cols[i]], cmap=FEATURE_CMAP,
+                                s=SCATTER_SIZE, vmin=MIR_VMIN_Z, vmax=MIR_VMAX_Z)
+        axs[i + 2].set_title(f"tSNE by {MIR_FEATURE_TITLES[i]}")
+        plt.colorbar(sc, ax=axs[i + 2])
+    for ax in axs:
+        ax.grid(False)
+    plt.tight_layout()
+    save_figure_both(fig, sub_png_dir, sub_svg_dir, f"{prefix}_clusters_grid")
 
-def init_csv(csv_path, columns):
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
+    # 2. Animal-Level Cell Counts Statistics & Barplot with Dots & Error Bars
+    animal_counts = df_clustered.groupby(["mouse_name", "cluster_id"]).size().reset_index(name="cell_count")
+    animal_counts["cluster_str"] = animal_counts["cluster_id"].astype(int).astype(str)
+    animal_counts["cluster_name"] = animal_counts["cluster_str"].map(CLUSTER_NAME_MAP_STR)
 
+    order = [c for c in ["0", "1", "2"] if c in animal_counts["cluster_str"].unique()]
+    cluster_names_order = [CLUSTER_NAME_MAP_STR[c] for c in order]
 
-def append_csv_row(csv_path, columns, row):
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writerow(row)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.barplot(
+        data=animal_counts, x="cluster_name", y="cell_count", order=cluster_names_order,
+        palette=[CLUSTER_COLOR_MAP_STR[c] for c in order], capsize=0.1, errwidth=1.5, ax=ax, alpha=0.85
+    )
+    sns.stripplot(
+        data=animal_counts, x="cluster_name", y="cell_count", order=cluster_names_order,
+        color="black", alpha=0.7, size=6, jitter=0.15, ax=ax
+    )
+    ax.set_title(f"{prefix}: Animal-Level Cell Counts per Cluster")
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("Number of Neurons per Animal")
+    plt.tight_layout()
+    save_figure_both(fig, sub_png_dir, sub_svg_dir, f"{prefix}_animal_level_cell_counts")
 
+    # One-Way ANOVA & Tukey HSD for Cell Counts
+    anova_text = f"--- ONE-WAY ANOVA & TUKEY HSD: CELL COUNTS ({prefix}) ---\n\n"
+    try:
+        model = ols('cell_count ~ C(cluster_name)', data=animal_counts).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        anova_text += anova_table.to_string() + "\n\n"
 
-# =============================================================================
-# Logging
-# =============================================================================
+        tukey = pairwise_tukeyhsd(endog=animal_counts["cell_count"], groups=animal_counts["cluster_name"], alpha=0.05)
+        anova_text += str(tukey) + "\n"
+    except Exception as e:
+        anova_text += f"ANOVA/Tukey failed: {e}\n"
+    save_text_file(sub_stats_dir, f"{prefix}_cell_counts_stats", anova_text)
 
-class Tee:
-    def __init__(self, *files):
-        self.files = files
+    # 3. Information Value Statistics: Two-Way ANOVA (Cluster x Feature) & Barplot
+    melted_info = df_clustered[df_clustered["cluster_id"] != UNASSIGNED_LABEL].melt(
+        id_vars=["mouse_name", "cluster_id"], value_vars=MIR_FEATURE_COLUMNS,
+        var_name="feature", value_name="MIR_value"
+    )
+    melted_info["cluster_str"] = melted_info["cluster_id"].astype(int).astype(str)
+    melted_info["cluster_name"] = melted_info["cluster_str"].map(CLUSTER_NAME_MAP_STR)
 
-    def write(self, obj):
-        for f in self.files:
-            f.write(obj)
-            f.flush()
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    sns.barplot(
+        data=melted_info, x="feature", y="MIR_value", hue="cluster_name",
+        palette=[CLUSTER_COLOR_MAP_STR[c] for c in order], capsize=0.1, errwidth=1.5, ax=ax, alpha=0.85
+    )
+    ax.set_xticklabels(MIR_FEATURE_TITLES, rotation=25)
+    ax.set_title(f"{prefix}: Mean Information Values by Feature & Cluster")
+    ax.set_xlabel("Behavioral Feature")
+    ax.set_ylabel("Mutual Information Rate (MIR)")
+    plt.legend(title="Cluster")
+    plt.tight_layout()
+    save_figure_both(fig, sub_png_dir, sub_svg_dir, f"{prefix}_information_values_barplot")
 
-    def flush(self):
-        for f in self.files:
-            f.flush()
+    # Two-Way ANOVA for Information Values: MIR_value ~ C(cluster_name) * C(feature)
+    info_stats_text = f"--- TWO-WAY ANOVA & TUKEY HSD: INFORMATION VALUES ({prefix}) ---\n\n"
+    try:
+        model_info = ols('MIR_value ~ C(cluster_name) * C(feature)', data=melted_info).fit()
+        anova_table_info = sm.stats.anova_lm(model_info, typ=2)
+        info_stats_text += "Two-Way ANOVA Table:\n" + anova_table_info.to_string() + "\n\n"
 
-
-# =============================================================================
-# Main processing
-# =============================================================================
-
-def process_row(row_idx, row):
-    standardized_file_path = row["standardized_file_path"]
-
-    if not os.path.isfile(standardized_file_path):
-        raise FileNotFoundError(f"Missing standardized file: {standardized_file_path}")
-
-    data = load_pickle_standard(standardized_file_path)
-
-    required_keys = ["signal", "pos", "mov_dir", "time"]
-    for key in required_keys:
-        if key not in data:
-            raise KeyError(f"Missing key '{key}' in file: {standardized_file_path}")
-
-    signal = ensure_2d(data["signal"])
-    pos_1d = ensure_1d(get_pos_1d(data["pos"]))
-    mov_dir = ensure_1d(data["mov_dir"])
-    time_1d = ensure_1d(data["time"])
-
-    speed = ensure_1d(data["speed"]) if data.get("speed", None) is not None else None
-    inner_time = ensure_1d(data["inner_time"]) if data.get("inner_time", None) is not None else None
-    trial_id = ensure_1d(data["trial_id"]) if data.get("trial_id", None) is not None else None
-
-    behavior_dict = {
-        "position": pos_1d,
-        "position_x_direction": pos_1d * mov_dir,
-        "speed": speed,
-        "time": time_1d,
-        "inner_time": inner_time,
-        "direction": mov_dir,
-        "trial_id": trial_id,
-    }
-    validate_lengths(signal, behavior_dict, row_idx=row_idx)
-
-    n_timepoints = signal.shape[0]
-    n_neurons = signal.shape[1]
-
-    if n_neurons < 1:
-        raise ValueError(f"Row {row_idx}: signal has no neurons")
-
-    if VERBOSE:
-        print(
-            f"Row {row_idx} | dataset={row['dataset_name']} | mouse={row['mouse_name']} | "
-            f"session={row['session_name']} | depth={row['depth_type']} | "
-            f"timepoints={n_timepoints} | neurons={n_neurons}"
-        )
-
-    mi_dict, _, _ = compute_mi_for_session(data)
-
-    recording_type = infer_recording_type(row)
-
-    # Save session pickle
-    session_base = base_name_from_row(row_idx, row) + "_mi"
-    session_pickle_name = session_base + ".pkl"
-    session_pickle_path = os.path.join(SESSION_PKL_DIR, session_pickle_name)
-
-    session_payload = {
-        "metadata": {
-            "dataset_name": row["dataset_name"],
-            "mouse_name": row["mouse_name"],
-            "session_name": row["session_name"],
-            "depth_type": row["depth_type"],
-            "recording_type": recording_type,
-            "row_index": row_idx,
-            "standardized_file_path": standardized_file_path,
-            "n_timepoints": n_timepoints,
-            "n_neurons": n_neurons,
-            "mi_method": "mutual_info_regression",
-            "mi_n_neighbors": MI_N_NEIGHBORS,
-            "mi_random_state": MI_RANDOM_STATE,
-            "behavior_labels": BEHAVIOR_LABELS,
-        },
-        "mi": mi_dict,
-    }
-    save_pickle_standard(session_pickle_path, session_payload)
-
-    # Build per-neuron rows
-    neuron_rows = []
-    for neuron_idx in range(n_neurons):
-        neuron_rows.append({
-            "dataset_name": row["dataset_name"],
-            "mouse_name": row["mouse_name"],
-            "session_name": row["session_name"],
-            "depth_type": row["depth_type"],
-            "recording_type": recording_type,
-            "standardized_file_path": standardized_file_path,
-            "row_index": row_idx,
-            "neuron_index": neuron_idx,
-            "n_timepoints": n_timepoints,
-            "n_neurons_in_session": n_neurons,
-            "mi_position": mi_dict["position"][neuron_idx] if mi_dict["position"] is not None else np.nan,
-            "mi_position_x_direction": mi_dict["position_x_direction"][neuron_idx] if mi_dict["position_x_direction"] is not None else np.nan,
-            "mi_speed": mi_dict["speed"][neuron_idx] if mi_dict["speed"] is not None else np.nan,
-            "mi_time": mi_dict["time"][neuron_idx] if mi_dict["time"] is not None else np.nan,
-            "mi_inner_time": mi_dict["inner_time"][neuron_idx] if mi_dict["inner_time"] is not None else np.nan,
-            "mi_direction": mi_dict["direction"][neuron_idx] if mi_dict["direction"] is not None else np.nan,
-            "mi_trial_id": mi_dict["trial_id"][neuron_idx] if mi_dict["trial_id"] is not None else np.nan,
-        })
-
-    # Build session summary row
-    session_row = {
-        "dataset_name": row["dataset_name"],
-        "mouse_name": row["mouse_name"],
-        "session_name": row["session_name"],
-        "depth_type": row["depth_type"],
-        "recording_type": recording_type,
-        "standardized_file_path": standardized_file_path,
-        "row_index": row_idx,
-        "n_timepoints": n_timepoints,
-        "n_neurons": n_neurons,
-        "mi_position_mean": np.nanmean(mi_dict["position"]) if mi_dict["position"] is not None else np.nan,
-        "mi_position_std": np.nanstd(mi_dict["position"]) if mi_dict["position"] is not None else np.nan,
-        "mi_position_x_direction_mean": np.nanmean(mi_dict["position_x_direction"]) if mi_dict["position_x_direction"] is not None else np.nan,
-        "mi_position_x_direction_std": np.nanstd(mi_dict["position_x_direction"]) if mi_dict["position_x_direction"] is not None else np.nan,
-        "mi_speed_mean": np.nanmean(mi_dict["speed"]) if mi_dict["speed"] is not None else np.nan,
-        "mi_speed_std": np.nanstd(mi_dict["speed"]) if mi_dict["speed"] is not None else np.nan,
-        "mi_time_mean": np.nanmean(mi_dict["time"]) if mi_dict["time"] is not None else np.nan,
-        "mi_time_std": np.nanstd(mi_dict["time"]) if mi_dict["time"] is not None else np.nan,
-        "mi_inner_time_mean": np.nanmean(mi_dict["inner_time"]) if mi_dict["inner_time"] is not None else np.nan,
-        "mi_inner_time_std": np.nanstd(mi_dict["inner_time"]) if mi_dict["inner_time"] is not None else np.nan,
-        "mi_direction_mean": np.nanmean(mi_dict["direction"]) if mi_dict["direction"] is not None else np.nan,
-        "mi_direction_std": np.nanstd(mi_dict["direction"]) if mi_dict["direction"] is not None else np.nan,
-        "mi_trial_id_mean": np.nanmean(mi_dict["trial_id"]) if mi_dict["trial_id"] is not None else np.nan,
-        "mi_trial_id_std": np.nanstd(mi_dict["trial_id"]) if mi_dict["trial_id"] is not None else np.nan,
-        "session_pickle_name": session_pickle_name,
-        "session_pickle_path": session_pickle_path,
-    }
-
-    if VERBOSE:
-        print(
-            "  Means | "
-            f"pos={session_row['mi_position_mean']:.4f} | "
-            f"pos*dir={session_row['mi_position_x_direction_mean']:.4f} | "
-            f"speed={session_row['mi_speed_mean']:.4f} | "
-            f"time={session_row['mi_time_mean']:.4f} | "
-            f"inner_time={session_row['mi_inner_time_mean']:.4f} | "
-            f"dir={session_row['mi_direction_mean']:.4f} | "
-            f"trial_id={session_row['mi_trial_id_mean']:.4f}"
-        )
-
-    return neuron_rows, session_row
+        # Tukey HSD post-hoc test across interaction groups (Cluster x Feature)
+        melted_info["group"] = melted_info["cluster_name"] + "_" + melted_info["feature"]
+        tukey_info = pairwise_tukeyhsd(endog=melted_info["MIR_value"], groups=melted_info["group"], alpha=0.05)
+        info_stats_text += "Tukey HSD Post-Hoc Test (Cluster x Feature groups):\n" + str(tukey_info) + "\n"
+    except Exception as e:
+        info_stats_text += f"Two-Way ANOVA/Tukey failed: {e}\n"
+    save_text_file(sub_stats_dir, f"{prefix}_information_values_twoway_anova_stats", info_stats_text)
 
 
 # =============================================================================
-# Main
+# Main Execution Loop
 # =============================================================================
 
 def main():
     ensure_dir(OUTPUT_DIR)
-    ensure_dir(SESSION_PKL_DIR)
-    ensure_dir(LOG_DIR)
 
-    if not os.path.isfile(CSV_PATH):
-        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+    if not os.path.isfile(MI_CSV):
+        raise FileNotFoundError(f"MI CSV not found: {MI_CSV}")
+    if not os.path.isfile(MASTER_INDEX_CSV):
+        raise FileNotFoundError(f"Master index CSV not found: {MASTER_INDEX_CSV}")
 
-    df = pd.read_csv(CSV_PATH)
+    df_mi = pd.read_csv(MI_CSV)
+    df_master = pd.read_csv(MASTER_INDEX_CSV)
 
-    if MAX_ROWS is not None:
-        df = df.iloc[:MAX_ROWS].copy()
+    join_cols = ["dataset_name", "mouse_name", "session_name", "depth_type"]
+    add_cols = [c for c in ["modality", "paradigm", "model", "int_i", "int_f"] if c in df_master.columns]
+    df_all = df_mi.merge(df_master[join_cols + add_cols].drop_duplicates(), on=join_cols, how="left")
+    df_all = add_neuron_uid(df_all)
 
-    init_csv(NEURON_MI_CSV, NEURON_MI_COLUMNS)
-    init_csv(SESSION_MI_CSV, SESSION_MI_COLUMNS)
+    base_datasets = [d for d in df_all["dataset_name"].dropna().astype(str).unique() if
+                     "lt_rot" not in d.lower() and "intervention" not in d.lower()]
 
-    log_path = os.path.join(LOG_DIR, "mutual_information_log.txt")
-    log_file = open(log_path, "w", encoding="utf-8")
-    original_stdout = os.sys.stdout
-    os.sys.stdout = Tee(original_stdout, log_file)
+    subsets_to_process = {}
+    for ds in base_datasets:
+        subsets_to_process[ds] = df_all[df_all["dataset_name"].astype(str).str.lower() == ds.lower()].copy()
 
-    print("==============================================================")
-    print("Mutual Information analysis pipeline")
-    print(f"Started: {datetime.now():%Y-%m-%d %H:%M}")
-    print("==============================================================")
-    print(f"Input CSV: {CSV_PATH}")
-    print(f"Rows to process: {len(df)}")
-    print(f"Output dir: {OUTPUT_DIR}")
-    print(f"Neuron CSV: {NEURON_MI_CSV}")
-    print(f"Session CSV: {SESSION_MI_CSV}")
-    print(f"Session PKL dir: {SESSION_PKL_DIR}")
-    print(f"MI n_neighbors: {MI_N_NEIGHBORS}")
-    print(f"MI random_state: {MI_RANDOM_STATE}")
-    print("")
+    # Split lt_rot into lt and rot explicitly[cite: 2]
+    lt_rot_df = df_all[df_all["dataset_name"].astype(str).str.lower().str.contains("lt_rot")].copy()
+    if not lt_rot_df.empty:
+        lt_mask = lt_rot_df["session_name"].astype(str).str.lower().str.contains("lt") & ~lt_rot_df[
+            "session_name"].astype(str).str.lower().str.contains("rot")
+        rot_mask = lt_rot_df["session_name"].astype(str).str.lower().str.contains("rot") & ~lt_rot_df[
+            "session_name"].astype(str).str.lower().str.contains("lt")
+        subsets_to_process["lt_rot_LT"] = lt_rot_df[lt_mask].copy()
+        subsets_to_process["lt_rot_ROT"] = lt_rot_df[rot_mask].copy()
 
-    ok_count = 0
-    fail_count = 0
-    global_time = timeit.default_timer()
+    # Handle intervention dataset (excluding sessions containing 'combined')
+    intervention_df = df_all[df_all["dataset_name"].astype(str).str.lower().str.contains("intervention")].copy()
+    if not intervention_df.empty:
+        clean_intervention = intervention_df[
+            ~intervention_df["session_name"].astype(str).str.lower().str.contains("combined")].copy()
+        clean_intervention["int_i_clean"] = clean_intervention["int_i"].fillna(0)
+        clean_intervention["int_f_clean"] = clean_intervention["int_f"].fillna(0)
+        subsets_to_process["intervention_clean"] = clean_intervention
 
-    for row_idx, row in df.iterrows():
-        local_time = timeit.default_timer()
+    for subset_name, df_subset in subsets_to_process.items():
+        if len(df_subset) < N_CLUSTERS:
+            print(f"[WARNING] Subset {subset_name} has too few neurons ({len(df_subset)}). Skipping.")
+            continue
+
+        print(f"\n==========================================")
+        print(f"Processing Subset: {subset_name} (n={len(df_subset)})")
+        print(f"==========================================")
+
+        sub_out_dir = os.path.join(OUTPUT_DIR, sanitize_for_filename(subset_name))
+        sub_data_dir = os.path.join(sub_out_dir, "data")
+        sub_png_dir = os.path.join(sub_out_dir, "png")
+        sub_svg_dir = os.path.join(sub_out_dir, "svg")
+        sub_stats_dir = os.path.join(sub_out_dir, "stats")
+        ensure_dir(sub_data_dir)
+        ensure_dir(sub_png_dir)
+        ensure_dir(sub_svg_dir)
+        ensure_dir(sub_stats_dir)
+
         try:
-            neuron_rows, session_row = process_row(row_idx, row)
-
-            for nr in neuron_rows:
-                append_csv_row(NEURON_MI_CSV, NEURON_MI_COLUMNS, nr)
-
-            append_csv_row(SESSION_MI_CSV, SESSION_MI_COLUMNS, session_row)
-
-            ok_count += 1
-            elapsed = timeit.default_timer() - local_time
-            print(f"[OK] Row {row_idx} finished in {elapsed:.2f} s\n")
-
+            df_clustered = cluster_single_dataset(df_subset)
         except Exception as e:
-            fail_count += 1
-            print(f"[ERROR] Row {row_idx}: {e}\n")
+            print(f"[WARNING] Clustering failed for {subset_name}: {e}")
+            continue
 
-    total_elapsed = timeit.default_timer() - global_time
-    print("==============================================================")
-    print("Done")
-    print(f"Finished: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"Successful entries: {ok_count}")
-    print(f"Failed entries: {fail_count}")
-    print(f"Total elapsed time: {total_elapsed:.2f} s")
-    print("==============================================================")
+        out_csv = os.path.join(sub_data_dir, f"{sanitize_for_filename(subset_name)}_labeled_neurons.csv")
+        df_clustered.to_csv(out_csv, index=False)
+        print(f"[OK] Saved: {out_csv}")
 
-    os.sys.stdout = original_stdout
-    log_file.close()
+        # Run analysis, plots, and stats
+        analyze_and_plot_subset(df_clustered, sub_png_dir, sub_svg_dir, sub_stats_dir,
+                                sanitize_for_filename(subset_name))
+
+        print(f"[OK] Finished subset: {subset_name}")
+
+    print("\nAll analyses complete.")
 
 
 if __name__ == "__main__":

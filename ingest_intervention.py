@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ingest_intervention.py  (versión todo-en-uno)
+ingest_intervention.py  (versión todo-en-uno con cálculo de trial_id e inner_time)
 
 Hace TODO el proceso de los datos "intervention" en un solo script:
 
-  PASO 1  (antes create_data_base.py)
+  PASO 1
       Localiza los archivos de cada sesión, divide las trazas de calcio en
       basal / sinusoidal, junta el tracking y crea manifest_database.csv.
 
-  PASO 2  (antes preprocess_data.py)
+  PASO 2
       Preprocesa trazas de calcio y tracking (Kalman, posición lineal,
-      velocidad, dirección...), genera los plots de trazas y guarda un pickle
-      por sesión + processed_database.csv.
+      velocidad, dirección, trial_id, inner_time...), genera los plots de trazas
+      y guarda un pickle por sesión + processed_database.csv.
 
-  PASO 3  (el ingest)
+  PASO 3
       Convierte cada sesión al formato estandarizado y añade sus filas a
-      master_dataset_index.csv (con int_i e int_f en columnas propias).
+      master_dataset_index.csv (con int_i, int_f, trial_id e inner_time).
 
 USO normal:        python ingest_intervention.py
 
@@ -26,9 +26,6 @@ Opciones (todas opcionales):
     --mouse 032 521    solo esos ratones
     --session 1 2      solo esas sesiones
     --date 1707        solo esas fechas
-
-Los pasos 1 y 2 guardan lo que ya han calculado, así que si vuelves a
-ejecutar el script solo se calcula lo que falte (por ejemplo, una sesión nueva).
 """
 
 from __future__ import annotations
@@ -50,12 +47,10 @@ from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import find_peaks
 from sklearn.decomposition import PCA
 
-
 # =============================================================================
-# RUTAS Y PARÁMETROS  (aquí es donde tienes que tocar cosas si cambian las rutas)
+# RUTAS Y PARÁMETROS
 # =============================================================================
 
-# --- Datos originales y resultados intermedios (pasos 1 y 2) ---
 BASE_DIR = Path("/home/hippolab/Documents/melisa/time_project_intervention")
 DATA_DIR = BASE_DIR / "data"
 DATABASE_DIR = BASE_DIR / "databases"
@@ -66,7 +61,6 @@ PLOTTING_TRACES_DIR = BASE_DIR / "plotting_traces"
 MANIFEST_CSV = DATABASE_DIR / "manifest_database.csv"
 PROCESSED_CSV = DATABASE_DIR / "processed_database.csv"
 
-# --- Proyecto de estandarización (paso 3; el mismo que usa ingest_learning) ---
 PROJECT_ROOT = Path("/home/hippolab/Documents/melisa/time_project_standarization")
 
 DATASET_NAME = "intervention"
@@ -76,12 +70,7 @@ CASE = "intervention"
 CELLS = "all_cells"
 SIGNAL_NAME = "retained_traces"
 
-# Qué condiciones se convierten al formato estándar.
-# "combined" es basal + sinusoidal pegadas. Borra "combined" si no la quieres.
 CONDITIONS = ["basal", "sinusoidal", "combined"]
-
-# False = si el archivo estandarizado ya existe, no lo vuelve a crear
-# (con --force sí se rehace)
 OVERWRITE_STANDARDIZED_FILES = False
 
 DATA_ROOT = PROJECT_ROOT / "data"
@@ -89,7 +78,6 @@ METADATA_DIR = DATA_ROOT / "metadata"
 STANDARDIZED_DIR = DATA_ROOT / "standardized_sessions" / DATASET_NAME / MODALITY / DEPTH_TYPE
 MASTER_CSV_PATH = METADATA_DIR / "master_dataset_index.csv"
 
-# Mismas columnas que ingest_learning_dataset.py + int_i e int_f
 MASTER_COLUMNS = [
     "dataset_name", "modality", "depth_type", "mouse_name", "session_name",
     "session_name_safe", "source_base_dir", "source_data_dir", "source_mouse_dir",
@@ -102,7 +90,6 @@ MASTER_COLUMNS = [
     "created_at", "notes",
 ]
 
-# --- Parámetros del preprocesado (paso 2) ---
 PARAMS = {
     "body_parts": ("neck", "back", "tail"),
     "likelihood_threshold": 0.95,
@@ -114,19 +101,16 @@ PARAMS = {
     "kalman_measurement_position_std": 0.01,
     "speed_threshold_m_s": 0.02,
     "direction_velocity_epsilon": 0.002,
-    # Deconvolución
     "sig_filt": 5.0,
     "sig_up": 4.0,
     "sig_down": 12.0,
     "peak_th": 0.1,
     "debleach_uniform_filter_size": 4000,
     "debleach_bins": 100,
-    # Suavizado después de seleccionar los frames
     "post_selection_gaussian_sigma_frames": 6.0,
     "post_selection_gaussian_mode": "nearest",
 }
 
-# int_i / int_f por defecto según la fecha de grabación (formato DDMM)
 DATE_PARAMS_MAP = {
     "1707": {"int_i": 3.0, "int_f": 0.17},
     "2309": {"int_i": 1.5, "int_f": 0.17},
@@ -135,11 +119,7 @@ DATE_PARAMS_MAP = {
     "0910": {"int_i": 1.5, "int_f": 1},
 }
 
-# =============================================================================
-# INVENTARIO COMPLETO DE ARCHIVOS (si hay sesiones nuevas, se añaden aquí)
-# =============================================================================
 SESSION_REGISTRY = [
-    # Mouse 032 - 1707 (Session 1)
     {
         "mouse_id": "032",
         "date": "1707",
@@ -149,27 +129,24 @@ SESSION_REGISTRY = [
         "sinus_avi": "032Sinus-temp-07172026141811-0000.avi",
         "sinus_tracking": "032Sinus-temp-07172026141811-0000DLC_resnet50_TimeJul22shuffle1_500000.csv",
     },
-    # Mouse 032 - 2309 (Session 2)
     {
         "mouse_id": "032",
         "date": "2309",
         "traces": "BS_032_2309_traces.csv",
         "basal_avi": "032Basal-temp-09232026162619-0000.avi",
         "basal_tracking": "032Basal-temp-09232026162619-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
-        "sinus_avi": "032Post-temp-09232026165714-0000.avi",  # Sinus/Post video available for this date
+        "sinus_avi": "032Post-temp-09232026165714-0000.avi",
         "sinus_tracking": "032Sinus-temp-09232026164148-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
     },
-    # Mouse 032 - 0110 (Session 3)
     {
         "mouse_id": "032",
         "date": "0110",
         "traces": "BS_032_0110_traces.csv",
         "basal_avi": "032Basal-temp-10012026154059-0000.avi",
         "basal_tracking": "032Basal-temp-10012026154059-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
-        "sinus_avi": "032Sinus-temp-10012026160003-0000.avi",  # Sinus/Post video available for this date
+        "sinus_avi": "032Sinus-temp-10012026160003-0000.avi",
         "sinus_tracking": "032Sinus-temp-10012026160003-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
     },
-    # Mouse 520 - 1707 (Session 1)
     {
         "mouse_id": "520",
         "date": "1707",
@@ -179,7 +156,6 @@ SESSION_REGISTRY = [
         "sinus_avi": "520Sinus-temp-07172026114508-0000.avi",
         "sinus_tracking": "520Sinus-temp-07172026114508-0000DLC_resnet50_TimeJul22shuffle1_500000.csv",
     },
-    # Mouse 520 - 0910 (Session 2)
     {
         "mouse_id": "520",
         "date": "0910",
@@ -189,7 +165,6 @@ SESSION_REGISTRY = [
         "sinus_avi": "520Sinus-temp-10092026162107-0000.avi",
         "sinus_tracking": "520Sinus-temp-10092026162107-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
     },
-    # Mouse 521 - 1707 (Session 1)
     {
         "mouse_id": "521",
         "date": "1707",
@@ -199,7 +174,6 @@ SESSION_REGISTRY = [
         "sinus_avi": "521Sinus-temp-07172026123237-0000.avi",
         "sinus_tracking": "521Sinus-temp-07172026123237-0000DLC_resnet50_TimeJul22shuffle1_500000.csv",
     },
-    # Mouse 521 - 2509 (Session 2)
     {
         "mouse_id": "521",
         "date": "2509",
@@ -209,7 +183,6 @@ SESSION_REGISTRY = [
         "sinus_avi": "521Sinus-temp-09252026165000-0000.avi",
         "sinus_tracking": "521Sinus-temp-09252026165000-0000DLC_Resnet50_linear_interventionOct1shuffle1_snapshot_best-110.csv",
     },
-    # Mouse 521 - 0110 (Session 3)
     {
         "mouse_id": "521",
         "date": "0110",
@@ -231,7 +204,6 @@ def ensure_dir(path: Path) -> None:
 
 
 def sanitize_for_filename(text) -> str:
-    """Cambia cualquier carácter raro por '_' para usarlo en nombres de archivo."""
     return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(text))
 
 
@@ -256,11 +228,62 @@ def banner(text: str) -> None:
 
 
 # =============================================================================
-# PASO 1: MANIFEST (antes create_data_base.py)
+# INFERENCIA DE TRIALS E INNER TIME
+# =============================================================================
+
+def infer_trials_and_inner_time(mov_dir: np.ndarray, time_arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Infiere trial_id e inner_time a partir de la dirección de movimiento (mov_dir) y el tiempo.
+    - Un trial comienza cuando el animal arranca en una dirección (cambio de dirección o reanudación tras pausa).
+    - inner_time es el tiempo transcurrido desde el inicio de cada trial.
+    """
+    mov_dir = np.asarray(mov_dir).flatten()
+    time_arr = np.asarray(time_arr).flatten()
+
+    n = len(mov_dir)
+    trial_id = np.zeros(n, dtype=int)
+    inner_time = np.zeros(n, dtype=float)
+
+    if n == 0:
+        return trial_id, inner_time
+
+    current_trial = 0
+    trial_start_time = time_arr[0]
+    prev_dir = mov_dir[0]
+
+    trial_id[0] = current_trial
+    inner_time[0] = 0.0
+
+    for i in range(1, n):
+        d = mov_dir[i]
+        t = time_arr[i]
+
+        # Consideramos nuevo trial si cambia de dirección de forma activa (ej. 1 a -1)
+        # o si estaba parado (0) y arranca en una dirección.
+        is_new_trial = False
+        if d != 0 and prev_dir != 0 and d != prev_dir:
+            is_new_trial = True
+        elif prev_dir == 0 and d != 0:
+            is_new_trial = True
+
+        if is_new_trial:
+            current_trial += 1
+            trial_start_time = t
+
+        trial_id[i] = current_trial
+        inner_time[i] = t - trial_start_time
+
+        if d != 0:
+            prev_dir = d
+
+    return trial_id, inner_time
+
+
+# =============================================================================
+# PASO 1: MANIFEST
 # =============================================================================
 
 def resolve_file(directory: Path, filename: Optional[str]) -> Optional[Path]:
-    """Devuelve la ruta del archivo, o None si no existe."""
     if not filename:
         return None
     path = directory / filename
@@ -273,14 +296,12 @@ def resolve_file(directory: Path, filename: Optional[str]) -> Optional[Path]:
 
 
 def parse_date_to_sort_key(date_str: str) -> int:
-    """Convierte DDMM (p. ej. 1707 -> día 17, mes 07) en un número MMDD para ordenar."""
     day = int(date_str[:2])
     month = int(date_str[2:4])
     return month * 100 + day
 
 
 def build_manifest_database(force: bool = False) -> pd.DataFrame:
-    # Ordena las sesiones cronológicamente por ratón y las numera 1, 2, 3...
     reg_df = pd.DataFrame(SESSION_REGISTRY)
     reg_df["sort_date"] = reg_df["date"].apply(parse_date_to_sort_key)
     reg_df = reg_df.sort_values(by=["mouse_id", "sort_date"]).reset_index(drop=True)
@@ -322,7 +343,7 @@ def build_manifest_database(force: bool = False) -> pd.DataFrame:
         combined_track_file = out_session_dir / f"{mouse_id}_{date_str}_combined_tracking.csv"
 
         already_split = (
-            basal_calcium_file.exists() and sinus_calcium_file.exists() and combined_track_file.exists()
+                basal_calcium_file.exists() and sinus_calcium_file.exists() and combined_track_file.exists()
         )
 
         if already_split and not force:
@@ -344,18 +365,13 @@ def build_manifest_database(force: bool = False) -> pd.DataFrame:
                     f"de calcio completas ({len(calcium_df)} frames) en ratón {mouse_id}, {date_str}."
                 )
 
-            # Divide las trazas en basal / sinusoidal
             basal_calcium_df = calcium_df.iloc[:basal_len].copy()
             sinus_calcium_df = calcium_df.iloc[basal_len:].copy()
             basal_calcium_df.to_csv(basal_calcium_file, index=False)
             sinus_calcium_df.to_csv(sinus_calcium_file, index=False)
-            print(f"  -> trazas basal: {basal_calcium_file.name} ({len(basal_calcium_df)} frames)")
-            print(f"  -> trazas sinusoidal: {sinus_calcium_file.name} ({len(sinus_calcium_df)} frames)")
 
-            # Tracking combinado
             combined_track_df = pd.concat([basal_track_df, sinus_track_df], axis=0)
             combined_track_df.to_csv(combined_track_file)
-            print(f"  -> tracking combinado: {combined_track_file.name} ({len(combined_track_df)} frames)")
 
         records.append({
             "mouse_id": mouse_id, "session": session_idx, "date": date_str,
@@ -383,28 +399,20 @@ def build_manifest_database(force: bool = False) -> pd.DataFrame:
     manifest_df.to_csv(MANIFEST_CSV, index=False)
 
     banner(f"Manifest guardado en:\n  {MANIFEST_CSV}")
-    print(manifest_df[["mouse_id", "session", "date", "condition", "int_i", "int_f"]].to_string())
     return manifest_df
 
 
 # =============================================================================
-# PASO 2: PREPROCESADO (antes preprocess_data.py)
+# PASO 2: PREPROCESADO
 # =============================================================================
 
 def preprocess_traces(
-    traces: np.ndarray,
-    sig_filt: float = 5.0,
-    sig_up: float = 4.0,
-    sig_down: float = 12.0,
-    peak_th: float = 0.1,
+        traces: np.ndarray,
+        sig_filt: float = 5.0,
+        sig_up: float = 4.0,
+        sig_down: float = 12.0,
+        peak_th: float = 0.1,
 ) -> np.ndarray:
-    """
-    Debleaching, umbral y convolución con kernel gaussiano asimétrico:
-    1. Filtro uniforme (boxcar) para estimar el photobleaching.
-    2. Suavizado gaussiano (sigma = sig_filt).
-    3. Alineación de la línea base por la moda, normalización y recorte (< 0 -> 0).
-    4. Detección de picos (umbral peak_th) y convolución con el kernel asimétrico.
-    """
     traces = np.asarray(traces, dtype=float).copy()
     lp_traces = uniform_filter1d(traces, size=int(PARAMS["debleach_uniform_filter_size"]), axis=0)
     clean_traces = gaussian_filter1d(traces, sigma=float(sig_filt), axis=0)
@@ -422,7 +430,6 @@ def preprocess_traces(
     clean_traces[clean_traces < 0] = 0.0
     conv_traces = np.zeros_like(clean_traces)
 
-    # Kernel gaussiano asimétrico
     gaus = lambda x, sig, amp, vo: amp * np.exp(-((x ** 2) / (2.0 * sig ** 2))) + vo
     half_w = int(round(5.0 * sig_down))
     x = np.arange(-half_w, half_w, 1, dtype=float)
@@ -561,16 +568,16 @@ def kalman_smooth(time_s: np.ndarray, x_m: np.ndarray, y_m: np.ndarray) -> Tuple
 
 
 def plot_raw_vs_processed_waterfall(
-    time_s: np.ndarray,
-    raw_traces: np.ndarray,
-    conv_traces: np.ndarray,
-    cell_names: List[str],
-    mouse_id: str,
-    session_idx: int,
-    date_str: str,
-    condition: str,
-    max_cells_to_plot: Optional[int] = 50,
-    zoom_window_s: Optional[float] = 60.0,
+        time_s: np.ndarray,
+        raw_traces: np.ndarray,
+        conv_traces: np.ndarray,
+        cell_names: List[str],
+        mouse_id: str,
+        session_idx: int,
+        date_str: str,
+        condition: str,
+        max_cells_to_plot: Optional[int] = 50,
+        zoom_window_s: Optional[float] = 60.0,
 ):
     n_cells_total = raw_traces.shape[1]
     n_plot = min(n_cells_total, max_cells_to_plot) if max_cells_to_plot is not None else n_cells_total
@@ -599,22 +606,19 @@ def plot_raw_vs_processed_waterfall(
     ax_full = axes[0]
     for i in range(n_plot):
         offset = i
-        ax_full.plot(time_s, norm_raw[:, i] + offset, color=color_raw, linewidth=0.8, alpha=0.65,
-                     label="Raw Traces" if i == 0 else "")
-        ax_full.plot(time_s, norm_conv[:, i] + offset, color=color_processed, linewidth=1.1, alpha=0.9,
-                     label="Processed Traces (Debleached & Convolved)" if i == 0 else "")
+        ax_full.plot(time_s, norm_raw[:, i] + offset, color=color_raw, linewidth=0.8, alpha=0.65)
+        ax_full.plot(time_s, norm_conv[:, i] + offset, color=color_processed, linewidth=1.1, alpha=0.9)
 
     ax_full.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
-    ax_full.set_ylabel("Neuron Index (Normalized [0, 1] + Offset)", fontsize=11, fontweight="bold")
+    ax_full.set_ylabel("Neuron Index", fontsize=11, fontweight="bold")
     ax_full.set_yticks(np.arange(n_plot))
     step = max(1, n_plot // 25)
     ytick_labels = [cell_names[i] if i % step == 0 else "" for i in range(n_plot)]
     ax_full.set_yticklabels(ytick_labels, fontsize=8)
-    ax_full.set_title(f"Full Session ({time_s[0]:.1f}s – {time_s[-1]:.1f}s)", fontsize=12, fontweight="bold")
+    ax_full.set_title(f"Full Session", fontsize=12, fontweight="bold")
     ax_full.set_ylim(-0.5, n_plot + 0.5)
     ax_full.set_xlim(time_s[0], time_s[-1])
     ax_full.grid(axis="y", linestyle=":", alpha=0.5)
-    ax_full.legend(loc="upper right", frameon=True, fontsize=10)
 
     if zoom_window_s and len(axes) > 1:
         ax_zoom = axes[1]
@@ -629,22 +633,16 @@ def plot_raw_vs_processed_waterfall(
 
         ax_zoom.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
         ax_zoom.set_xlim(time_s[0], t_end_zoom)
-        ax_zoom.set_title(f"Zoomed Inspection Window ({time_s[0]:.1f}s – {t_end_zoom:.1f}s)", fontsize=12,
-                          fontweight="bold")
+        ax_zoom.set_title(f"Zoomed Window", fontsize=12, fontweight="bold")
         ax_zoom.grid(axis="y", linestyle=":", alpha=0.5)
 
-    title_str = (
-        f"Raw vs. Processed Calcium Traces (Before Speed Cut)\n"
-        f"Mouse {mouse_id} | Session {session_idx} ({date_str}) | Condition: {condition.capitalize()} "
-        f"({n_plot} / {n_cells_total} neurons shown)"
-    )
-    fig.suptitle(title_str, fontsize=14, fontweight="bold", y=0.995)
-    fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
+    fig.suptitle(f"Mouse {mouse_id} | Session {session_idx} ({date_str}) | {condition.capitalize()}", fontsize=14,
+                 fontweight="bold")
+    fig.tight_layout()
 
     out_file = PLOTTING_TRACES_DIR / f"traces_raw_vs_processed_M{mouse_id}_S{session_idx}_{date_str}_{condition}.png"
     fig.savefig(out_file, dpi=250)
     plt.close(fig)
-    print(f"  [PLOT GUARDADO] {out_file.name}")
 
 
 def process_single_condition(traces: np.ndarray, time_s: np.ndarray, track_df: pd.DataFrame,
@@ -701,6 +699,12 @@ def process_single_condition(traces: np.ndarray, time_s: np.ndarray, track_df: p
     direction[vel > PARAMS["direction_velocity_epsilon"]] = 1
     direction[vel < -PARAMS["direction_velocity_epsilon"]] = -1
 
+    # Inferencia de trial_id e inner_time en función del tiempo y la dirección
+    sync_t_abs = time_s
+    t_sub = sync_t_abs
+    dir_sub = direction
+    trial_id_full, inner_time_full = infer_trials_and_inner_time(dir_sub, t_sub)
+
     speed_mask = speed > PARAMS["speed_threshold_m_s"]
     border_mask = (lin_pos > PARAMS["track_edge_exclusion_fraction"]) & (
             lin_pos < 1.0 - PARAMS["track_edge_exclusion_fraction"]
@@ -725,13 +729,14 @@ def process_single_condition(traces: np.ndarray, time_s: np.ndarray, track_df: p
         "position_1d": lin_pos[ret_idx],
         "speed": speed[ret_idx],
         "direction": direction[ret_idx],
+        "trial_id": trial_id_full[ret_idx],
+        "inner_time": inner_time_full[ret_idx],
         "keep_mask": keep_mask,
     }
 
 
 def preprocess_one_session(s_df: pd.DataFrame, mouse_id: str, session_idx: int, date_str: str,
                            plot_traces: bool) -> Dict:
-    """Preprocesa basal + sinusoidal de una sesión y devuelve el paquete (payload) a guardar."""
     s_indexed = s_df.set_index("condition")
     int_i_val = float(s_indexed.loc["sinusoidal", "int_i"])
     int_f_val = float(s_indexed.loc["sinusoidal", "int_f"])
@@ -742,7 +747,6 @@ def preprocess_one_session(s_df: pd.DataFrame, mouse_id: str, session_idx: int, 
     res_basal = process_single_condition(c_basal, t_basal, df_track_b, f_idx_b)
 
     if plot_traces:
-        print("  Plot de trazas basal...")
         n_sync_b = len(res_basal["all_traces_conv"])
         plot_raw_vs_processed_waterfall(
             time_s=res_basal["sync_time"][:n_sync_b],
@@ -758,15 +762,7 @@ def preprocess_one_session(s_df: pd.DataFrame, mouse_id: str, session_idx: int, 
     df_track_s, f_idx_s = read_dlc(Path(s_indexed.loc["sinusoidal", "path_tracking"]))
     res_sinus = process_single_condition(c_sinus, t_sinus, df_track_s, f_idx_s)
 
-    if res_basal["retained_traces"].shape[1] != res_sinus["retained_traces"].shape[1]:
-        raise ValueError(
-            "Basal y sinusoidal tienen distinto número de neuronas tras el filtrado "
-            f"({res_basal['retained_traces'].shape[1]} vs {res_sinus['retained_traces'].shape[1]}), "
-            "así que no se pueden pegar en 'combined'."
-        )
-
     if plot_traces:
-        print("  Plot de trazas sinusoidal...")
         n_sync_s = len(res_sinus["all_traces_conv"])
         plot_raw_vs_processed_waterfall(
             time_s=res_sinus["sync_time"][:n_sync_s],
@@ -783,17 +779,22 @@ def preprocess_one_session(s_df: pd.DataFrame, mouse_id: str, session_idx: int, 
     comb_speed = np.concatenate([res_basal["speed"], res_sinus["speed"]])
     comb_dir = np.concatenate([res_basal["direction"], res_sinus["direction"]])
 
+    # Recomputar trial_id e inner_time para combined para que sean continuos
     dt_b = float(np.median(np.diff(res_basal["sync_time"]))) if len(res_basal["sync_time"]) > 1 else 0.05
     t_b_zero = res_basal["sync_time"][res_basal["sync_indices"]] - res_basal["sync_time"][0]
     offset = t_b_zero[-1] + dt_b if len(t_b_zero) > 0 else 0.0
     t_s_zero = res_sinus["sync_time"][res_sinus["sync_indices"]] - res_sinus["sync_time"][0] + offset
     comb_time = np.concatenate([t_b_zero, t_s_zero])
 
+    comb_trial_id, comb_inner_time = infer_trials_and_inner_time(comb_dir, comb_time)
+
     res_combined = {
         "retained_traces": comb_traces,
         "position_1d": comb_pos,
         "speed": comb_speed,
         "direction": comb_dir,
+        "trial_id": comb_trial_id,
+        "inner_time": comb_inner_time,
         "time_seconds": comb_time,
         "condition_labels": np.array(
             ["basal"] * len(res_basal["position_1d"]) + ["sinusoidal"] * len(res_sinus["position_1d"]),
@@ -815,14 +816,13 @@ def preprocess_one_session(s_df: pd.DataFrame, mouse_id: str, session_idx: int, 
 
 
 def preprocess_sessions(
-    manifest_df: pd.DataFrame,
-    filter_mice: Optional[List[str]] = None,
-    filter_sessions: Optional[List[int]] = None,
-    filter_dates: Optional[List[str]] = None,
-    force_recompute: bool = False,
-    plot_traces: bool = True,
+        manifest_df: pd.DataFrame,
+        filter_mice: Optional[List[str]] = None,
+        filter_sessions: Optional[List[int]] = None,
+        filter_dates: Optional[List[str]] = None,
+        force_recompute: bool = False,
+        plot_traces: bool = True,
 ) -> Tuple[List[Path], List[Tuple[str, str]]]:
-    """Preprocesa las sesiones seleccionadas. Devuelve (lista de pickles, lista de fallos)."""
     record_map = {}
     if PROCESSED_CSV.exists():
         proc_df = pd.read_csv(PROCESSED_CSV, dtype={"mouse_id": str, "date": str})
@@ -855,7 +855,6 @@ def preprocess_sessions(
 
         if (not force_recompute and session_key in record_map and target_pkl.exists()
                 and (plots_already_exist or not plot_traces)):
-            print(f"[YA HECHO] {label}: preprocesado y plots ya existen")
             selected_pickles.append(target_pkl)
             continue
 
@@ -869,7 +868,6 @@ def preprocess_sessions(
             continue
 
         save_pickle(target_pkl, payload)
-        print(f"  -> pickle guardado: {target_pkl.name}")
         selected_pickles.append(target_pkl)
 
         record_map[session_key] = {
@@ -881,20 +879,12 @@ def preprocess_sessions(
             "pickle_path": str(target_pkl),
             "retained_basal_frames": len(payload["basal"]["position_1d"]),
             "retained_sinus_frames": len(payload["sinusoidal"]["position_1d"]),
-            "speed_threshold_m_s": PARAMS["speed_threshold_m_s"],
-            "edge_exclusion_fraction": PARAMS["track_edge_exclusion_fraction"],
-            "sig_filt": PARAMS["sig_filt"],
-            "peak_th": PARAMS["peak_th"],
-            "post_gaussian_sigma": PARAMS["post_selection_gaussian_sigma_frames"],
         }
 
     if record_map:
         updated_df = pd.DataFrame(list(record_map.values()))
         updated_df = updated_df.sort_values(by=["mouse_id", "session"]).reset_index(drop=True)
         updated_df.to_csv(PROCESSED_CSV, index=False)
-        banner(f"Processed database guardada en:\n  {PROCESSED_CSV}\nPlots de trazas en:\n  {PLOTTING_TRACES_DIR}")
-        print(updated_df[["mouse_id", "session", "date", "int_i", "int_f", "retained_basal_frames",
-                          "retained_sinus_frames"]].to_string())
 
     return selected_pickles, failures
 
@@ -904,7 +894,6 @@ def preprocess_sessions(
 # =============================================================================
 
 def intervention_params(payload: Dict, condition: str) -> Tuple[float, float]:
-    """basal = sin intervención (0, 0); sinusoidal y combined llevan los valores de la sesión."""
     if condition == "basal":
         return 0.0, 0.0
     return float(payload["int_i"]), float(payload["int_f"])
@@ -914,12 +903,13 @@ def build_standardized_dict(payload: Dict, condition: str, mouse_name: str, sess
     res = payload[condition]
     int_i, int_f = intervention_params(payload, condition)
 
-    signal = np.asarray(res["retained_traces"], dtype=float)  # tiempo x neuronas
+    signal = np.asarray(res["retained_traces"], dtype=float)
     pos = np.asarray(res["position_1d"], dtype=float).reshape(-1, 1)
     mov_dir = np.asarray(res["direction"]).reshape(-1, 1)
     speed = np.asarray(res["speed"], dtype=float).reshape(-1, 1)
+    trial_id = np.asarray(res["trial_id"], dtype=int).reshape(-1, 1)
+    inner_time = np.asarray(res["inner_time"], dtype=float).reshape(-1, 1)
 
-    # Vector de tiempo (segundos, empezando en 0)
     if condition == "combined":
         time = np.asarray(res["time_seconds"], dtype=float)
     else:
@@ -928,7 +918,8 @@ def build_standardized_dict(payload: Dict, condition: str, mouse_name: str, sess
     time = time.reshape(-1, 1)
 
     n_timepoints = signal.shape[0]
-    for name, arr in [("pos", pos), ("mov_dir", mov_dir), ("speed", speed), ("time", time)]:
+    for name, arr in [("pos", pos), ("mov_dir", mov_dir), ("speed", speed), ("time", time), ("trial_id", trial_id),
+                      ("inner_time", inner_time)]:
         if arr.shape[0] != n_timepoints:
             raise ValueError(
                 f"Longitudes distintas en {mouse_name}/{session_name}: "
@@ -955,9 +946,9 @@ def build_standardized_dict(payload: Dict, condition: str, mouse_name: str, sess
         "pos": pos,
         "mov_dir": mov_dir,
         "speed": speed,
-        "trial_id": None,  # intervention no tiene trials definidos
+        "trial_id": trial_id,
         "time": time,
-        "inner_time": None,  # tampoco tiene inner time
+        "inner_time": inner_time,
     }
 
 
@@ -1034,12 +1025,6 @@ def ingest_session_pickle(source_file_path: Path, overwrite: bool) -> List[Dict]
 
 
 def update_master_csv(new_rows: List[Dict], replace_whole_dataset: bool) -> None:
-    """
-    Añade las filas nuevas al CSV maestro SIN borrar las de otros datasets (p. ej. learning).
-    - replace_whole_dataset=True: borra todas las filas antiguas de 'intervention' y escribe las nuevas.
-    - replace_whole_dataset=False (cuando usas --mouse/--session/--date): solo reemplaza
-      las sesiones que acabas de procesar y deja el resto de intervention como estaba.
-    """
     ensure_dir(METADATA_DIR)
     new_df = pd.DataFrame(new_rows, columns=MASTER_COLUMNS)
 
@@ -1068,24 +1053,23 @@ def update_master_csv(new_rows: List[Dict], replace_whole_dataset: bool) -> None
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Intervention: manifest + preprocesado + ingest estandarizado")
-    parser.add_argument("--mouse", nargs="+", help="Solo estos ratones (p. ej. --mouse 032 521)")
-    parser.add_argument("--session", nargs="+", type=int, help="Solo estas sesiones (p. ej. --session 1 2)")
-    parser.add_argument("--date", nargs="+", help="Solo estas fechas (p. ej. --date 1707 2309)")
-    parser.add_argument("--force", action="store_true", help="Rehace todo (divisiones, preprocesado, plots, estandarizado)")
-    parser.add_argument("--no-plots", action="store_true", help="No genera los plots de trazas")
+    parser = argparse.ArgumentParser(
+        description="Intervention: manifest + preprocesado + ingest estandarizado con trials")
+    parser.add_argument("--mouse", nargs="+", help="Solo estos ratones")
+    parser.add_argument("--session", nargs="+", type=int, help="Solo estas sesiones")
+    parser.add_argument("--date", nargs="+", help="Solo estas fechas")
+    parser.add_argument("--force", action="store_true", help="Rehace todo")
+    parser.add_argument("--no-plots", action="store_true", help="No genera los plots")
     args, _ = parser.parse_known_args()
 
     for d in [DATABASE_DIR, SPLIT_DATA_DIR, PROCESSED_PICKLE_DIR, PLOTTING_TRACES_DIR,
               METADATA_DIR, STANDARDIZED_DIR]:
         ensure_dir(d)
 
-    # PASO 1
-    banner("PASO 1/3: manifest (dividir trazas, juntar tracking)")
+    banner("PASO 1/3: manifest")
     manifest_df = build_manifest_database(force=args.force)
 
-    # PASO 2
-    banner("PASO 2/3: preprocesado de trazas y tracking")
+    banner("PASO 2/3: preprocesado de trazas y tracking (con inferencia de trials)")
     pickles, failures = preprocess_sessions(
         manifest_df,
         filter_mice=args.mouse,
@@ -1095,7 +1079,6 @@ def main():
         plot_traces=not args.no_plots,
     )
 
-    # PASO 3
     banner("PASO 3/3: conversión al formato estandarizado")
     overwrite = args.force or OVERWRITE_STANDARDIZED_FILES
     all_rows: List[Dict] = []
@@ -1115,10 +1098,6 @@ def main():
     banner("LISTO")
     print(f"Filas escritas para '{DATASET_NAME}': {len(all_rows)}")
     print(f"CSV maestro: {MASTER_CSV_PATH}")
-    if failures:
-        print(f"\nOJO: {len(failures)} sesión(es) fallaron:")
-        for lab, msg in failures:
-            print(f"  - {lab}: {msg}")
 
 
 if __name__ == "__main__":

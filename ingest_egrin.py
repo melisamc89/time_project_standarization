@@ -1,379 +1,452 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Neural Manifold Embedding Overlaid with CWT Spectral Power Bands.
-
-Plots 3D UMAP/PCA neural embeddings colored by:
-Row 1: Position, Direction, Speed, Time, and Delta Slow CWT Power [0.01 - 0.1 Hz]
-Row 2: Delta Fast [1 - 3 Hz], Theta [8 - 12 Hz], Gamma [40 - 90 Hz],
-       HFO/Ripple [100 - 250 Hz], MUA [300 - 1000 Hz]
-
-Integrates directly with the downsampled CWT matrix and frequency grid
-from the standardized session files.
+"""Hybrid Ingestion Pipeline:
+1. Neural Data: Clean traces + speed thresholding (> 3.0) + Gaussian smoothing (sigma = 6) from lt_egrin_data.pkl.
+2. LFP & CWT: Raw LFP extraction, best theta channel selection, continuous CWT, and Hilbert envelopes/phases
+   loaded directly from individual .mat files.
 """
 
-import os
+import csv
+from datetime import datetime
 import glob
+import os
 import pickle
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.colors import Normalize, ListedColormap, BoundaryNorm
+from scipy.integrate import trapezoid
+from scipy.interpolate import interp1d
+from scipy.io import loadmat
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+from scipy.signal import butter, fftconvolve, hilbert, sosfiltfilt, welch
 
 # =============================================================================
-# Paths & Configuration
+# Directories & Settings
 # =============================================================================
 
 PROJECT_ROOT = "/home/hippolab/Documents/melisa/time_project_standarization"
+SOURCE_BASE_DIR = "/home/hippolab/Documents/melisa/lt_egrin_project"
+SOURCE_PICKLE_FILE = os.path.join(SOURCE_BASE_DIR, "data", "lt_egrin_data.pkl")
+SOURCE_MAT_DIR = os.path.join(SOURCE_BASE_DIR, "data")  # Where mouse folders containing .mat files reside
+
+DATASET_NAME = "lt_egrin"
+MODALITY = "calcium_imaging"
+
+SPEED_TH = 3.0
+SIG_FILT = 6.0
+FS_IMAGING = 20.0
+
+OVERWRITE_STANDARDIZED_FILES = True
+
+CODE_DIR = os.path.join(PROJECT_ROOT, "code")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+ANALYSIS_DIR = os.path.join(PROJECT_ROOT, "analysis")
+DIAGNOSTICS_DIR = os.path.join(ANALYSIS_DIR, "cwt_and_lfp_diagnostics")
+METADATA_DIR = os.path.join(DATA_DIR, "metadata")
 STANDARDIZED_DIR = os.path.join(
-    PROJECT_ROOT, "data", "standardized_sessions", "lt_egrin", "calcium_imaging"
+    DATA_DIR,
+    "standardized_sessions",
+    DATASET_NAME,
+    MODALITY,
 )
-EMBEDDING_DATA_DIR = os.path.join(
-    PROJECT_ROOT, "analysis", "umap_pca_per_row", "embedding_data"
-)
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "analysis", "cwt_manifold_spectrum")
 
-PNG_DIR = os.path.join(OUTPUT_DIR, "png")
-SVG_DIR = os.path.join(OUTPUT_DIR, "svg")
+MASTER_CSV_PATH = os.path.join(METADATA_DIR, "master_dataset_index.csv")
 
-# Frequency bands matching the canonical CWT reference figure
-CWT_BANDS = [
-    {"key": "delta_slow", "name": "Delta [0.01 - 0.1 Hz]",  "f_low": 0.01,  "f_high": 0.1,    "unit": "Delta (dB)"},
-    {"key": "delta_fast", "name": "Delta [1 - 3 Hz]",       "f_low": 1.0,   "f_high": 3.0,    "unit": "Delta (dB)"},
-    {"key": "theta",      "name": "Theta [8 - 12 Hz]",      "f_low": 8.0,   "f_high": 12.0,   "unit": "Theta (dB)"},
-    {"key": "gamma",      "name": "Gamma [40 - 90 Hz]",     "f_low": 40.0,  "f_high": 90.0,   "unit": "Gamma (dB)"},
-    {"key": "hfo",        "name": "HFO [100 - 250 Hz]",     "f_low": 100.0, "f_high": 250.0,  "unit": "HFO (dB)"},
-    {"key": "mua",        "name": "MUA [300 - 1000 Hz]",    "f_low": 300.0, "f_high": 1000.0, "unit": "MUA (dB)"},
+MASTER_COLUMNS = [
+    "dataset_name", "modality", "depth_type", "mouse_name", "session_name",
+    "session_name_safe", "source_base_dir", "source_data_dir", "source_mouse_dir",
+    "source_file_name", "source_file_path", "case", "cells", "signal_name",
+    "best_theta_channel", "fs_lfp", "cwt_fmin", "cwt_fmax", "n_cwt_freqs",
+    "paradigm", "model", "standardized_file_name", "standardized_file_path",
+    "n_timepoints", "n_neurons", "pos_dim", "contains_signal", "contains_pos",
+    "contains_mov_dir", "contains_speed", "contains_trial_id", "contains_time",
+    "contains_inner_time", "contains_full_rate_lfp", "source_container_type",
+    "common_crop_length", "created_at", "notes"
 ]
 
-EMBEDDING_METHOD = "umap"  # "umap" or "pca"
-CMAP_DB_POWER = "jet"
+LFP_BANDS = {
+    "slow":   (0.01,  0.10),
+    "delta":  (1.00,  3.00),
+    "theta":  (8.00,  12.00),
+    "gamma":  (40.00, 90.00),
+    "ripple": (100.0, 250.0),
+    "mua":    (300.0, 1000.0)
+}
+
+CWT_FMIN = 0.001
+CWT_FMAX = 1000.0
+CWT_NUM_FREQS = 90
+CWT_W0 = 6.0
 
 
 # =============================================================================
-# Helpers
+# Helper Functions
 # =============================================================================
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def load_pickle(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def sanitize_for_filename(text):
+    text = str(text)
+    return "".join([ch if (ch.isalnum() or ch in ["-", "_"]) else "_" for ch in text])
 
 
-def style_3d_axis(ax, title):
-    ax.set_title(title, fontsize=9, pad=4)
-    ax.grid(False)
-    for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
-        try:
-            axis.pane.fill = False
-            axis.pane.set_edgecolor("white")
-        except Exception:
-            pass
-    ax.set_xlabel("x", labelpad=-7, fontsize=7)
-    ax.set_ylabel("y", labelpad=-7, fontsize=7)
-    ax.set_zlabel("z", labelpad=-7, fontsize=7)
-    ax.tick_params(labelsize=6)
+def ensure_col(x):
+    x = np.asarray(x)
+    return x.reshape(-1, 1) if x.ndim == 1 else x
 
 
-def get_direction_colors():
-    cmap = ListedColormap(["#1f77b4", "#7f7f7f", "#17becf"])  # -1 (left), 0 (none), 1 (right)
-    norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], cmap.N)
-    return cmap, norm
+def infer_depth_from_mouse_name(mouse_name):
+    low = mouse_name.lower()
+    if "calb" in low:
+        return "superficial"
+    if "thy" in low:
+        return "deep"
+    return "unknown"
 
 
-def resolve_standardized_path(meta):
-    source_pkl = meta.get("source_standardized_file_path", "")
-    if source_pkl and os.path.isfile(source_pkl):
-        return source_pkl
+def compute_inner_time(trial_id, fs):
+    trial_id = np.asarray(trial_id).reshape(-1)
+    inner_time = np.zeros_like(trial_id, dtype=float)
+    if len(trial_id) == 0:
+        return inner_time.reshape(-1, 1)
 
-    mouse_name = str(meta.get("mouse_name", "")).strip()
-    depth_type = str(meta.get("depth_type", "")).strip()
+    current_trial = trial_id[0]
+    start_idx = 0
+    for i in range(1, len(trial_id)):
+        if trial_id[i] != current_trial:
+            current_trial = trial_id[i]
+            start_idx = i
+        inner_time[i] = (i - start_idx) / fs
+    return inner_time.reshape(-1, 1)
 
-    if mouse_name:
-        candidates = glob.glob(
-            os.path.join(STANDARDIZED_DIR, "**", f"*{mouse_name}*.pkl"), recursive=True
+
+def compute_movement_direction(position, sf=20.0, speed_th=2.0):
+    pos_x = np.asarray(position)[:, 0] if position.ndim > 1 else np.asarray(position)
+    x_speed = np.diff(pos_x) / (1.0 / sf)
+    x_speed = np.hstack((x_speed[0], x_speed))
+    x_speed = uniform_filter1d(x_speed, size=int(sf))
+
+    mov_dir = np.zeros_like(x_speed, dtype=int)
+    mov_dir[x_speed > speed_th] = 1
+    mov_dir[x_speed < -speed_th] = -1
+    return mov_dir
+
+
+# =============================================================================
+# Hilbert & CWT Extraction Functions
+# =============================================================================
+
+def extract_lfp_bands_and_hilbert_20hz(lfp_chan, fs_lfp, target_len, fs_target=20.0):
+    t_lfp = np.arange(len(lfp_chan)) / fs_lfp
+    t_target = np.arange(target_len) / fs_target
+
+    extracted_dict = {}
+    smooth_win = max(1, int(round((1.0 / fs_target) * fs_lfp)))
+    nyquist = fs_lfp / 2.0
+
+    for label, (low, high) in LFP_BANDS.items():
+        high_safe = min(high, nyquist - 1.0)
+        low_safe = max(0.0005, low)
+
+        if low_safe >= high_safe:
+            w_20hz = np.zeros(target_len, dtype=float)
+            extracted_dict[f"lfp_{label}"] = w_20hz
+            extracted_dict[f"lfp_{label}_20hz"] = w_20hz
+            extracted_dict[f"lfp_{label}_envelope"] = w_20hz
+            extracted_dict[f"lfp_{label}_hilbert_20hz"] = w_20hz
+            extracted_dict[f"lfp_{label}_phase"] = w_20hz
+            extracted_dict[f"lfp_{label}_phase_20hz"] = w_20hz
+            continue
+
+        sos = butter(2 if low_safe < 0.1 else 3, [low_safe, high_safe], btype="bandpass", fs=fs_lfp, output="sos")
+        filt_full = sosfiltfilt(sos, lfp_chan)
+
+        analytic_sig = hilbert(filt_full)
+        env_full = np.abs(analytic_sig)
+        phase_full = np.angle(analytic_sig)
+
+        f_sig = interp1d(t_lfp, filt_full, bounds_error=False, fill_value="extrapolate")
+        w_20hz = f_sig(t_target)
+
+        env_smooth = uniform_filter1d(env_full, size=smooth_win)
+        f_env = interp1d(t_lfp, env_smooth, bounds_error=False, fill_value="extrapolate")
+        env_20hz = f_env(t_target)
+
+        phase_unwrapped = np.unwrap(phase_full)
+        f_phase = interp1d(t_lfp, phase_unwrapped, bounds_error=False, fill_value="extrapolate")
+        phase_20hz_unwrapped = f_phase(t_target)
+        phase_20hz = (phase_20hz_unwrapped + np.pi) % (2.0 * np.pi) - np.pi
+
+        extracted_dict[f"lfp_{label}"] = w_20hz
+        extracted_dict[f"lfp_{label}_20hz"] = w_20hz
+        extracted_dict[f"lfp_{label}_envelope"] = env_20hz
+        extracted_dict[f"lfp_{label}_hilbert_20hz"] = env_20hz
+        extracted_dict[f"lfp_{label}_phase"] = phase_20hz
+        extracted_dict[f"lfp_{label}_phase_20hz"] = phase_20hz
+
+    return extracted_dict
+
+
+def select_maximal_theta_channel(lfp_raw, fs, speed=None):
+    n_channels = lfp_raw.shape[1]
+    theta_powers = np.zeros(n_channels, dtype=float)
+
+    eval_matrix = lfp_raw[speed > SPEED_TH, :] if (speed is not None and np.sum(speed > SPEED_TH) > int(5 * fs)) else lfp_raw
+    nperseg = int(min(eval_matrix.shape[0], round(2.0 * fs)))
+
+    for ch in range(n_channels):
+        freqs, psd = welch(eval_matrix[:, ch], fs=fs, nperseg=nperseg, noverlap=nperseg // 2, scaling="density")
+        theta_mask = (freqs >= 8.0) & (freqs <= min(12.0, fs / 2.0 - 0.5))
+        if np.sum(theta_mask) == 0:
+            theta_mask = (freqs >= 1.0) & (freqs <= min(3.0, fs / 2.0 - 0.5))
+        theta_powers[ch] = trapezoid(psd[theta_mask], freqs[theta_mask])
+
+    best_ch = int(np.argmax(theta_powers))
+    print(f"  Selected Channel {best_ch + 1} with max theta power: {theta_powers[best_ch]:.2e}")
+    return best_ch
+
+
+def compute_full_cwt(signal_1d, fs):
+    n_pts = len(signal_1d)
+    total_sec = n_pts / fs
+    fmax_safe = min(CWT_FMAX, fs / 2.0 - 0.5)
+    freqs = np.geomspace(CWT_FMIN, fmax_safe, CWT_NUM_FREQS)
+    cwt_power = np.zeros((n_pts, CWT_NUM_FREQS), dtype=np.float32)
+
+    print(f"  Computing CWT ({CWT_NUM_FREQS} scales from {CWT_FMIN:.3e} Hz to {fmax_safe:.1f} Hz)...")
+    for i, f0 in enumerate(freqs):
+        s = CWT_W0 / (2.0 * np.pi * f0)
+        t_max = min(4.0 * s, max(8.0, total_sec * 0.5))
+        t_kern = np.arange(-t_max, t_max, 1.0 / fs)
+        wavelet = (
+                np.pi ** (-0.25)
+                * np.exp(1j * 2.0 * np.pi * f0 * t_kern)
+                * np.exp(-0.5 * (t_kern / s) ** 2)
         )
-        if candidates:
-            if depth_type:
-                for c in candidates:
-                    if depth_type in c:
-                        return c
-            return candidates[0]
+        wavelet /= np.sqrt(s * fs)
+        conv = fftconvolve(signal_1d, wavelet, mode="same")
+        cwt_power[:, i] = (np.abs(conv) ** 2).astype(np.float32)
 
-    return None
+    return cwt_power, freqs
 
 
 # =============================================================================
-# CWT Band Power Extraction
+# Main Processing Pipeline (Hybrid: Pickle Clean Traces + .mat LFP Files)
 # =============================================================================
 
-def extract_cwt_band_powers(cwt_matrix, cwt_freqs, target_len):
-    """
-    Integrates spectral power across frequency bands from the 20 Hz CWT matrix
-    and converts to logarithmic decibels: 10 * log10(power).
-    """
-    if cwt_matrix is None or cwt_freqs is None:
+def process_mouse(mouse_name, mouse_pickle_data):
+    depth_type = infer_depth_from_mouse_name(mouse_name)
+
+    # 1. Load Neural Activity from Pickle File
+    raw_traces = np.asarray(mouse_pickle_data["clean_traces"], dtype=float)
+    n_frames = raw_traces.shape[0]
+
+    position = np.asarray(mouse_pickle_data["position"])
+    speed = np.asarray(mouse_pickle_data["speed"]).reshape(-1)
+    trial_id = np.asarray(mouse_pickle_data["trial_id"]).reshape(-1)
+    mov_dir = np.asarray(mouse_pickle_data["mov_direction"]).reshape(-1)
+    t_beh = np.arange(n_frames) / FS_IMAGING
+
+    # 2. Locate and Load Raw LFP from Corresponding .mat file
+    mouse_dir = os.path.join(SOURCE_MAT_DIR, mouse_name)
+    mat_candidates = glob.glob(os.path.join(mouse_dir, "*_tracesLFP.mat"))
+    if not mat_candidates:
+        mat_candidates = glob.glob(os.path.join(mouse_dir, "*.mat"))
+
+    if not mat_candidates:
+        print(f"[WARNING] No .mat file found for {mouse_name} in {mouse_dir}. Skipping LFP extraction.")
         return None
 
-    cwt_matrix = np.asarray(cwt_matrix)
-    cwt_freqs = np.asarray(cwt_freqs).reshape(-1)
+    mat_path = mat_candidates[0]
+    mat_file_name = os.path.basename(mat_path)
+    print(f"\n{'='*70}\nLoading LFP from .mat for: {mouse_name} ({mat_file_name})\n{'='*70}")
 
-    # Standardize dimensions (time x freqs)
-    if cwt_matrix.ndim == 2:
-        if cwt_matrix.shape[0] == len(cwt_freqs) and cwt_matrix.shape[1] != len(cwt_freqs):
-            cwt_repr = cwt_matrix.T
-        else:
-            cwt_repr = cwt_matrix
+    mat_data = loadmat(mat_path, simplify_cells=True)
+    tlfp = mat_data["tracesLFP"]
+
+    raw_lfp = np.asarray(tlfp["LFP"]["LFP"], dtype=float)
+    if raw_lfp.shape[0] == 16 and raw_lfp.shape[1] > 16:
+        raw_lfp = raw_lfp.T
+
+    lfp_time = tlfp["LFP"].get("time", None)
+    if lfp_time is not None and len(lfp_time) > 1:
+        t_lfp = np.asarray(lfp_time).reshape(-1)
+        fs_lfp = 1.0 / np.nanmedian(np.diff(t_lfp))
     else:
-        return None
+        fs_lfp = float(raw_lfp.shape[0]) / (float(n_frames) / FS_IMAGING)
+        t_lfp = np.linspace(0, (n_frames - 1) / FS_IMAGING, raw_lfp.shape[0])
 
-    # Length alignment
-    if cwt_repr.shape[0] != target_len:
-        if cwt_repr.shape[0] > target_len:
-            cwt_repr = cwt_repr[:target_len, :]
-        else:
-            pad_width = ((0, target_len - cwt_repr.shape[0]), (0, 0))
-            cwt_repr = np.pad(cwt_repr, pad_width, mode="edge")
+    print(f"  LFP Raw Matrix: {raw_lfp.shape} | fs: {fs_lfp:.1f} Hz")
 
-    band_features = {}
-    for band in CWT_BANDS:
-        bkey = band["key"]
-        f_low, f_high = band["f_low"], band["f_high"]
+    speed_on_lfp = interp1d(t_beh, speed, bounds_error=False, fill_value="extrapolate")(t_lfp)
+    best_ch_idx = select_maximal_theta_channel(raw_lfp, fs_lfp, speed=speed_on_lfp)
+    best_lfp_raw = raw_lfp[:, best_ch_idx]
 
-        f_indices = np.where((cwt_freqs >= f_low) & (cwt_freqs <= f_high))[0]
-        if len(f_indices) == 0:
-            nearest_idx = np.argmin(np.abs(cwt_freqs - 0.5 * (f_low + f_high)))
-            f_indices = np.array([nearest_idx])
+    cwt_full, cwt_freqs = compute_full_cwt(best_lfp_raw, fs_lfp)
 
-        band_slice = cwt_repr[:, f_indices]
-        # Calculate mean band power and convert to dB
-        mean_power = np.nanmean(band_slice, axis=1)
-        power_db = 10.0 * np.log10(np.maximum(mean_power, 1e-12))
-        band_features[bkey] = power_db
+    print(f"  Extracting Hilbert bands, envelopes, and phases -> downsampling to {FS_IMAGING} Hz...")
+    cwt_20hz_continuous = interp1d(t_lfp, cwt_full, axis=0, bounds_error=False, fill_value="extrapolate")(t_beh)
+    lfp_hilbert_dict = extract_lfp_bands_and_hilbert_20hz(best_lfp_raw, fs_lfp, target_len=n_frames, fs_target=FS_IMAGING)
+    lfp_raw_20hz = interp1d(t_lfp, best_lfp_raw, axis=0, bounds_error=False, fill_value="extrapolate")(t_beh).reshape(-1, 1)
 
-    return band_features
+    # 3. Apply Speed Thresholding (> 3.0) and Gaussian Filtering (sigma = 6)
+    is_running = speed > SPEED_TH
+    valid_index = np.where(is_running)[0]
 
+    print(f"  Frames: {n_frames} | Retained running frames: {len(valid_index)} ({100*len(valid_index)/n_frames:.1f}%)")
 
-# =============================================================================
-# 2x5 Reference Plotter
-# =============================================================================
+    inner_time_full = compute_inner_time(trial_id, FS_IMAGING)
 
-def plot_cwt_manifold_grid(embedding, behavior, cwt_bands, metadata, view_angles=None):
-    fig = plt.figure(figsize=(20.0, 7.8))
-    gs = gridspec.GridSpec(2, 5, figure=fig, hspace=0.30, wspace=0.28)
+    signal_filtered = raw_traces[valid_index, :]
+    signal_filtered = gaussian_filter1d(signal_filtered, sigma=SIG_FILT, axis=0)
 
-    title = (
-        f"{metadata.get('dataset_name', 'lt_egrin')} | {metadata.get('mouse_name', '')} | "
-        f"{metadata.get('depth_type', '')} | Neural Manifold Overlaid with CWT Power (dB)"
-    )
-    fig.suptitle(title, fontsize=12, y=0.98)
+    pos_filtered = ensure_col(position[valid_index]) if position.ndim == 1 else position[valid_index, :]
+    speed_filtered = ensure_col(speed[valid_index])
+    mov_dir_filtered = ensure_col(mov_dir[valid_index])
+    trial_id_filtered = ensure_col(trial_id[valid_index])
+    inner_time_filtered = ensure_col(inner_time_full[valid_index])
+    time_filtered = ensure_col(valid_index / FS_IMAGING)
 
-    elev = view_angles.get("elev", 30.0) if view_angles else 30.0
-    azim = view_angles.get("azim", 45.0) if view_angles else 45.0
+    cwt_20hz_filtered = cwt_20hz_continuous[valid_index, :]
+    lfp_20hz_filtered = lfp_raw_20hz[valid_index, :]
+    hilbert_features_filtered = {k: ensure_col(v[valid_index]) for k, v in lfp_hilbert_dict.items()}
 
-    pos_1d = behavior["pos"]
-    mov_dir = behavior["mov_dir"]
-    speed_1d = behavior["speed"]
-    time_1d = behavior["time"]
+    standardized = {
+        "metadata": {
+            "dataset_name": DATASET_NAME,
+            "modality": MODALITY,
+            "depth_type": depth_type,
+            "mouse_name": mouse_name,
+            "session_name": "lt_egrin",
+            "case": f"speed_threshold_{SPEED_TH}_gaussian_sigma{SIG_FILT}_mat_lfp_suite",
+            "cells": "all_cells",
+            "signal_name": f"clean_traces_gaussian_sigma{SIG_FILT}",
+            "fs": FS_IMAGING,
+            "fs_lfp": float(fs_lfp),
+            "signal_fs_final": FS_IMAGING,
+            "best_theta_channel": int(best_ch_idx + 1),
+            "cwt_fmin": float(cwt_freqs[0]),
+            "cwt_fmax": float(cwt_freqs[-1]),
+            "n_cwt_freqs": len(cwt_freqs),
+            "has_cwt": True,
+            "has_lfp_bands": True,
+            "has_lfp_envelopes": True,
+            "has_lfp_phases": True,
+            "has_full_rate_lfp": True,
+            "total_session_frames": int(n_frames),
+            "retained_valid_frames": int(len(valid_index)),
+        },
+        "signal": signal_filtered,
+        "pos": pos_filtered,
+        "speed": speed_filtered,
+        "mov_dir": mov_dir_filtered,
+        "trial_id": trial_id_filtered,
+        "time": time_filtered,
+        "inner_time": inner_time_filtered,
+        "lfp_20hz": lfp_20hz_filtered,
+        "cwt": cwt_20hz_filtered,
+        "cwt_freqs": np.asarray(cwt_freqs, dtype=float),
+        "valid_index": valid_index,
+        **hilbert_features_filtered,
+        "lfp_full_rate_clean": raw_lfp,
+        "t_lfp": t_lfp,
+    }
 
-    # -------------------------------------------------------------------------
-    # ROW 1: Position, Direction, Speed, Time, Delta Slow [0.01 - 0.1 Hz]
-    # -------------------------------------------------------------------------
-    # 1. Position
-    ax1 = fig.add_subplot(gs[0, 0], projection="3d")
-    sc1 = ax1.scatter(
-        embedding[:, 0], embedding[:, 1], embedding[:, 2],
-        c=pos_1d, cmap="magma", s=3.5, alpha=0.9
-    )
-    style_3d_axis(ax1, "Position")
-    ax1.view_init(elev=elev, azim=azim)
-    cb1 = fig.colorbar(sc1, ax=ax1, fraction=0.035, pad=0.04)
-    cb1.set_label("position (cm)", fontsize=7)
-    cb1.ax.tick_params(labelsize=6)
-
-    # 2. Direction
-    ax2 = fig.add_subplot(gs[0, 1], projection="3d")
-    dir_cmap, dir_norm = get_direction_colors()
-    sc2 = ax2.scatter(
-        embedding[:, 0], embedding[:, 1], embedding[:, 2],
-        c=mov_dir, cmap=dir_cmap, norm=dir_norm, s=3.5, alpha=0.9
-    )
-    style_3d_axis(ax2, "Direction")
-    ax2.view_init(elev=elev, azim=azim)
-    cb2 = fig.colorbar(sc2, ax=ax2, fraction=0.035, pad=0.04, ticks=[-1, 0, 1])
-    cb2.ax.set_yticklabels(["left", "stop", "right"], fontsize=6)
-
-    # 3. Speed
-    ax3 = fig.add_subplot(gs[0, 2], projection="3d")
-    sc3 = ax3.scatter(
-        embedding[:, 0], embedding[:, 1], embedding[:, 2],
-        c=speed_1d, cmap="viridis", s=3.5, alpha=0.9
-    )
-    style_3d_axis(ax3, "Speed")
-    ax3.view_init(elev=elev, azim=azim)
-    cb3 = fig.colorbar(sc3, ax=ax3, fraction=0.035, pad=0.04)
-    cb3.set_label("speed (cm/s)", fontsize=7)
-    cb3.ax.tick_params(labelsize=6)
-
-    # 4. Time
-    ax4 = fig.add_subplot(gs[0, 3], projection="3d")
-    sc4 = ax4.scatter(
-        embedding[:, 0], embedding[:, 1], embedding[:, 2],
-        c=time_1d, cmap="YlGn_r", s=3.5, alpha=0.9
-    )
-    style_3d_axis(ax4, "Time")
-    ax4.view_init(elev=elev, azim=azim)
-    cb4 = fig.colorbar(sc4, ax=ax4, fraction=0.035, pad=0.04)
-    cb4.set_label("time (s)", fontsize=7)
-    cb4.ax.tick_params(labelsize=6)
-
-    # 5. Delta Slow [0.01 - 0.1 Hz]
-    d_slow = cwt_bands["delta_slow"]
-    ax5 = fig.add_subplot(gs[0, 4], projection="3d")
-    if d_slow is not None:
-        p1, p99 = np.nanpercentile(d_slow, 1), np.nanpercentile(d_slow, 99)
-        norm5 = Normalize(vmin=p1, vmax=max(p99, p1 + 1e-3))
-        sc5 = ax5.scatter(
-            embedding[:, 0], embedding[:, 1], embedding[:, 2],
-            c=d_slow, cmap=CMAP_DB_POWER, norm=norm5, s=3.5, alpha=0.85
-        )
-        style_3d_axis(ax5, CWT_BANDS[0]["name"])
-        ax5.view_init(elev=elev, azim=azim)
-        cb5 = fig.colorbar(sc5, ax=ax5, fraction=0.035, pad=0.04)
-        cb5.set_label(CWT_BANDS[0]["unit"], fontsize=7)
-        cb5.ax.tick_params(labelsize=6)
-    else:
-        style_3d_axis(ax5, CWT_BANDS[0]["name"])
-        ax5.text(0.5, 0.5, 0.5, "N/A", ha="center", va="center", color="gray")
-
-    # -------------------------------------------------------------------------
-    # ROW 2: Delta Fast, Theta, Gamma, HFO, MUA
-    # -------------------------------------------------------------------------
-    row2_bands = CWT_BANDS[1:]
-    for col_idx, cfg in enumerate(row2_bands):
-        bkey = cfg["key"]
-        val = cwt_bands.get(bkey, None)
-        ax = fig.add_subplot(gs[1, col_idx], projection="3d")
-
-        if val is not None and len(val) == len(embedding):
-            p1, p99 = np.nanpercentile(val, 1), np.nanpercentile(val, 99)
-            norm = Normalize(vmin=p1, vmax=max(p99, p1 + 1e-3))
-            sc = ax.scatter(
-                embedding[:, 0], embedding[:, 1], embedding[:, 2],
-                c=val, cmap=CMAP_DB_POWER, norm=norm, s=3.5, alpha=0.85
-            )
-            style_3d_axis(ax, cfg["name"])
-            ax.view_init(elev=elev, azim=azim)
-            cb = fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.04)
-            cb.set_label(cfg["unit"], fontsize=7)
-            cb.ax.tick_params(labelsize=6)
-        else:
-            style_3d_axis(ax, cfg["name"])
-            ax.text(
-                0.5, 0.5, 0.5, "Band Absent", ha="center", va="center",
-                transform=ax.transAxes, color="gray", fontsize=7
-            )
-
-    return fig
+    return standardized, depth_type, mat_file_name, mat_path, int(best_ch_idx + 1), float(fs_lfp), cwt_freqs
 
 
-# =============================================================================
-# Main Pipeline
-# =============================================================================
+def append_to_master_csv(csv_path, standardized, mouse_name, depth_type, src_name, src_path, std_name, std_path, best_theta_ch, fs_lfp, cwt_freqs):
+    sig = standardized["signal"]
+    pos = standardized["pos"]
+    row = {
+        "dataset_name": DATASET_NAME, "modality": MODALITY, "depth_type": depth_type,
+        "mouse_name": mouse_name, "session_name": "lt_egrin", "session_name_safe": "lt_egrin",
+        "source_base_dir": SOURCE_BASE_DIR, "source_data_dir": SOURCE_MAT_DIR,
+        "source_mouse_dir": os.path.dirname(src_path), "source_file_name": src_name,
+        "source_file_path": src_path, "case": standardized["metadata"]["case"],
+        "cells": standardized["metadata"]["cells"], "signal_name": standardized["metadata"]["signal_name"],
+        "best_theta_channel": best_theta_ch, "fs_lfp": f"{fs_lfp:.2f}",
+        "cwt_fmin": f"{cwt_freqs[0]:.6f}", "cwt_fmax": f"{cwt_freqs[-1]:.2f}",
+        "n_cwt_freqs": len(cwt_freqs), "paradigm": "", "model": "",
+        "standardized_file_name": std_name, "standardized_file_path": std_path,
+        "n_timepoints": int(sig.shape[0]), "n_neurons": int(sig.shape[1]),
+        "pos_dim": int(pos.shape[1]) if pos.ndim > 1 else 1,
+        "contains_signal": "yes" if sig is not None else "no",
+        "contains_pos": "yes" if pos is not None else "no",
+        "contains_mov_dir": "yes" if standardized["mov_dir"] is not None else "no",
+        "contains_speed": "yes" if standardized["speed"] is not None else "no",
+        "contains_trial_id": "yes" if standardized["trial_id"] is not None else "no",
+        "contains_time": "yes" if standardized["time"] is not None else "no",
+        "contains_inner_time": "yes" if standardized["inner_time"] is not None else "no",
+        "contains_full_rate_lfp": "yes", "source_container_type": "hybrid_pickle_and_mat",
+        "common_crop_length": "", "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "notes": f"Clean traces from pickle + raw LFP from .mat (Ch {best_theta_ch})."
+    }
+
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MASTER_COLUMNS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 def main():
-    ensure_dir(OUTPUT_DIR)
-    ensure_dir(PNG_DIR)
-    ensure_dir(SVG_DIR)
+    for p in [CODE_DIR, DATA_DIR, ANALYSIS_DIR, DIAGNOSTICS_DIR, METADATA_DIR, STANDARDIZED_DIR]:
+        ensure_dir(p)
 
-    emb_files = sorted(glob.glob(os.path.join(EMBEDDING_DATA_DIR, "*_embedding_behavior.pkl")))
-    egrin_files = [f for f in emb_files if "egrin" in os.path.basename(f).lower()]
-    targets = egrin_files if len(egrin_files) > 0 else emb_files
+    if not os.path.isfile(MASTER_CSV_PATH):
+        with open(MASTER_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=MASTER_COLUMNS).writeheader()
 
-    print(f"Processing {len(targets)} sessions for CWT manifold visualization...")
-    count = 0
+    if not os.path.isfile(SOURCE_PICKLE_FILE):
+        raise FileNotFoundError(f"Source pickle file not found: {SOURCE_PICKLE_FILE}")
 
-    for idx, emb_path in enumerate(targets):
-        emb_data = load_pickle(emb_path)
-        meta = emb_data.get("metadata", {})
+    with open(SOURCE_PICKLE_FILE, "rb") as f:
+        data = pickle.load(f)
 
-        std_path = resolve_standardized_path(meta)
-        if std_path is None or not os.path.isfile(std_path):
-            print(f"[{idx+1}/{len(targets)}] Skip: standardized file not found for {meta.get('mouse_name')}")
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected source data to be a dict, got {type(data)}")
+
+    print(f"Loaded source pickle with {len(data)} mice: {sorted(data.keys())}")
+
+    total_rows = 0
+    for mouse_name in sorted(data.keys()):
+        mouse_pickle_data = data[mouse_name]
+
+        res = process_mouse(mouse_name, mouse_pickle_data)
+        if res is None:
             continue
 
-        std_data = load_pickle(std_path)
-        if "cwt" not in std_data or std_data["cwt"] is None or "cwt_freqs" not in std_data:
-            print(f"[{idx+1}/{len(targets)}] Skip: CWT not present in {os.path.basename(std_path)}")
-            continue
+        standardized, depth_type, src_name, src_path, best_ch, fs_lfp, freqs = res
 
-        embedding = emb_data.get(EMBEDDING_METHOD.lower(), None)
-        if embedding is None:
-            continue
+        mouse_out_dir = os.path.join(STANDARDIZED_DIR, depth_type, mouse_name)
+        ensure_dir(mouse_out_dir)
 
-        n_points = embedding.shape[0]
-
-        # Extract behavior aligned to embedding length
-        beh = emb_data.get("behavior", {})
-        pos_1d = beh.get("pos", None)
-        mov_dir = beh.get("mov_dir", None)
-        time_1d = beh.get("time", None)
-        speed_1d = beh.get("speed", None)
-
-        if pos_1d is None:
-            pos_1d = np.asarray(std_data["pos"])
-            pos_1d = pos_1d[:, 0] if pos_1d.ndim > 1 else pos_1d
-        if mov_dir is None:
-            mov_dir = np.asarray(std_data["mov_dir"]).reshape(-1)
-        if time_1d is None:
-            time_1d = np.asarray(std_data["time"]).reshape(-1)
-        if speed_1d is None:
-            speed_1d = np.asarray(std_data["speed"]).reshape(-1)
-
-        behavior_payload = {
-            "pos": np.asarray(pos_1d).reshape(-1)[:n_points],
-            "mov_dir": np.asarray(mov_dir).reshape(-1)[:n_points],
-            "speed": np.asarray(speed_1d).reshape(-1)[:n_points],
-            "time": np.asarray(time_1d).reshape(-1)[:n_points],
-        }
-
-        # Extract CWT band power from the ingested 20 Hz matrix
-        cwt_bands = extract_cwt_band_powers(
-            cwt_matrix=std_data["cwt"],
-            cwt_freqs=std_data["cwt_freqs"],
-            target_len=n_points,
+        std_file_name = sanitize_for_filename(
+            f"{DATASET_NAME}_{mouse_name}_lt_egrin_{MODALITY}_{depth_type}_{standardized['metadata']['signal_name']}.pkl"
         )
+        if not std_file_name.endswith(".pkl"):
+            std_file_name += ".pkl"
 
-        view_angles = meta.get(f"{EMBEDDING_METHOD.lower()}_view_angles", None)
-        dataset_name = meta.get("dataset_name", "lt_egrin")
-        mouse_name = meta.get("mouse_name", "mouse")
-        depth_type = meta.get("depth_type", "depth")
-        session_name = meta.get("session_name", "session")
+        std_file_path = os.path.join(mouse_out_dir, std_file_name)
 
-        file_prefix = f"{dataset_name}_{mouse_name}_{session_name}_{depth_type}_{EMBEDDING_METHOD}_cwt_manifold"
+        if os.path.exists(std_file_path) and not OVERWRITE_STANDARDIZED_FILES:
+            print(f"File exists, skipping save: {std_file_name}")
+        else:
+            with open(std_file_path, "wb") as f:
+                pickle.dump(standardized, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"  Standardized dataset written to: {std_file_path}")
 
-        fig = plot_cwt_manifold_grid(
-            embedding=embedding,
-            behavior=behavior_payload,
-            cwt_bands=cwt_bands,
-            metadata=meta,
-            view_angles=view_angles,
+        append_to_master_csv(
+            csv_path=MASTER_CSV_PATH, standardized=standardized, mouse_name=mouse_name,
+            depth_type=depth_type, src_name=src_name, src_path=src_path, std_name=std_file_name,
+            std_path=std_file_path, best_theta_ch=best_ch, fs_lfp=fs_lfp, cwt_freqs=freqs
         )
+        total_rows += 1
 
-        png_out = os.path.join(PNG_DIR, f"{file_prefix}.png")
-        svg_out = os.path.join(SVG_DIR, f"{file_prefix}.svg")
-        fig.savefig(png_out, dpi=200, bbox_inches="tight")
-        fig.savefig(svg_out, bbox_inches="tight")
-        plt.close(fig)
-
-        print(f"[{idx+1}/{len(targets)}] Saved figure -> {png_out}")
-        count += 1
-
-    print(f"\n[DONE] Successfully exported {count} CWT manifold figures to:\n  {OUTPUT_DIR}")
+    print(f"\n[SUCCESS] Completed hybrid ingestion successfully across {total_rows} mice.")
 
 
 if __name__ == "__main__":

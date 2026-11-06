@@ -1,26 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 # -*- coding: utf-8 -*-
 
 """
-Train MIR-based clustering/openTSNE on the learning dataset and transfer
-the trained model to other datasets.
+Train MIR-based clustering/openTSNE on the learning dataset, transfer
+the trained model, and generate extensive LFP multi-band and behavioral regression analyses.
 
-This version:
-1) Parses session date from session_name (YYYYMMDD_HHMMSS)
-2) Trains on latest session per mouse from the learning dataset
-3) Uses only MIR features
-4) Row-wise z-score across the 7 MIR behaviors
-5) StandardScaler across cells
-6) KMeans on training
-7) Uses 75% centroid-distance thresholds for training; independently configurable percentile during transfer
-8) Fits openTSNE on training
-9) Transfers ALL cells; distant neurons are labeled 10 (Unassigned)
-10) Saves neuron-level CSVs with original MI info + cluster_id + tsne coords + neuron_uid
-11) Adds statistics .txt files for every barplot
-12) For behavior × cluster plots, runs two-way ANOVA + pairwise Welch t-tests
-13) For lt_rot, splits ONLY using session_name containing 'lt' or 'rot'
-14) Fixes seaborn categorical palette issues and ticklabel warnings
-15) Fixes stats file writing bug and uses chi-square goodness-of-fit for 1D count bars
+Integrated features:
+1) Corrected semantic mapping rule (Position = Pink/2, Time = Green/0, Direction = Cyan/1).
+2) Standardized 3x3 t-SNE embedding grids for all LFP features (Waveforms, Envelopes, Phases, CWT Linear & Log).
+3) Cluster-wise barplots for LFP features with overlaid black data points and stats.
+4) Cluster-colored bivariate log-scale density contour plots (Position vs Ripple/MUA, Time vs Slow).
+5) Grouped correlation/regression heatmaps structured by frequency band and modality.
+6) Depth count plots with SEM error bars and per-mouse black scatter points (excluding unassigned in stats).
 """
 
 import os
@@ -35,22 +26,27 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from scipy.stats import zscore, ttest_ind, chi2_contingency, chisquare
+from scipy.stats import zscore, ttest_ind, chi2_contingency, chisquare, pearsonr
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
 from openTSNE import TSNE
 
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
+from matplotlib.colors import LogNorm, Normalize
 
 # =============================================================================
 # Paths
 # =============================================================================
 
-MI_CSV = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/mutual_information/mutual_information_per_neuron.csv"
-MASTER_INDEX_CSV = "/home/hippolab/Documents/melisa/time_project_standarization/data/metadata/master_dataset_index.csv"
+PROJECT_ROOT = "/home/hippolab/Documents/melisa/time_project_standarization"
 
-OUTPUT_DIR = "/home/hippolab/Documents/melisa/time_project_standarization/analysis/mir_training_and_transfer"
+MI_CSV = os.path.join(PROJECT_ROOT, "analysis", "mutual_information_behavior_and_lfp",
+                      "mutual_information_per_neuron.csv")
+MASTER_INDEX_CSV = os.path.join(PROJECT_ROOT, "data", "metadata", "master_dataset_index.csv")
+
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "analysis", "mir_training_and_transfer_behavior_and_lfp_updated")
 TRAIN_DIR = os.path.join(OUTPUT_DIR, "training")
 TRANSFER_DIR = os.path.join(OUTPUT_DIR, "transfer")
 
@@ -64,7 +60,6 @@ TRAIN_STATS_DIR = os.path.join(TRAIN_DIR, "stats")
 # Parameters
 # =============================================================================
 
-# Replace with the exact dataset_name(s) for the learning dataset
 LEARNING_DATASET_NAMES = [
     "learning",
     "learning_dataset",
@@ -73,7 +68,6 @@ LEARNING_DATASET_NAMES = [
 USE_LEARNERS_ONLY = False
 LEARNER_MICE = ["M2019", "M2023", "M2024", "M2025", "M2026"]
 
-# MIR features only, matching old code order
 MIR_FEATURE_COLUMNS = [
     "mi_position",
     "mi_position_x_direction",
@@ -99,11 +93,7 @@ UNASSIGNED_LABEL = 10
 KMEANS_RANDOM_STATE = 42
 KMEANS_N_INIT = 50
 TRAIN_KEEP_PERCENTILE = 75
-# Transfer cutoff is a percentile of the LEARNING cluster-distance distribution.
-# 75 reproduces the training cutoff; 90 is more permissive; 50 is stricter.
 TRANSFER_KEEP_PERCENTILE = 90
-# Optional per-dataset override in TRANSFER_CONFIGS:
-#   "transfer_keep_percentile": 90,
 
 TSNE_PERPLEXITY = 50
 TSNE_RANDOM_STATE = 42
@@ -120,18 +110,18 @@ MIR_VMAX_RAW = 0.35
 MIR_VMIN_Z = -1.0
 MIR_VMAX_Z = 3.5
 
-# cluster colors from previous code
+# Cluster Color and Name Maps (Position = Pink/2, Time = Green/0, Direction = Cyan/1)
 CLUSTER_COLOR_MAP = {
-    2: "#ec8ef8ff",  # Position
-    1: "#66cef4ff",  # Direction
-    0: "#bce784ff",  # Time
+    2: "#ec8ef8ff",  # Position (Pink)
+    0: "#bce784ff",  # Time (Green)
+    1: "#66cef4ff",  # Direction (Cyan)
     10: "#bbbcc0ff",  # Unassigned
 }
 
 CLUSTER_COLOR_MAP_STR = {
     "2": "#ec8ef8ff",
-    "1": "#66cef4ff",
     "0": "#bce784ff",
+    "1": "#66cef4ff",
     "10": "#bbbcc0ff",
 }
 
@@ -159,7 +149,6 @@ DEPTH_COLOR_MAP = {
     "unknown": "gray",
 }
 
-# Adapt these if your dataset_name values differ
 TRANSFER_CONFIGS = [
     {
         "name": "lt_rot_lt",
@@ -191,11 +180,23 @@ TRANSFER_CONFIGS = [
         "subset_mode": "all",
         "depth_mode": "all",
     },
+    {
+        "name": "dreadds",
+        "dataset_name_contains": ["dreadds"],
+        "subset_mode": "all",
+        "depth_mode": "all",
+    },
+    {
+        "name": "intervention",
+        "dataset_name_contains": ["intervention"],
+        "subset_mode": "all",
+        "depth_mode": "all",
+    },
 ]
 
 
 # =============================================================================
-# Basic helpers
+# Basic Helpers
 # =============================================================================
 
 def ensure_dir(path):
@@ -338,7 +339,7 @@ def print_available_values(df_mi, df_master):
 
 
 # =============================================================================
-# Statistics helpers
+# Statistics Helpers
 # =============================================================================
 
 def pval_to_star(pval):
@@ -545,8 +546,87 @@ def run_two_way_anova_and_pairs(df, factor_a, factor_b, value_col, title):
 
 
 # =============================================================================
-# Training / transfer models
+# LFP Feature Discovery Helpers
 # =============================================================================
+
+def discover_lfp_columns(df):
+    cols = df.columns.tolist()
+    lfp_features = []
+    for c in cols:
+        if c.startswith("mi_lfp_") or c.startswith("mi_cwt_"):
+            lfp_features.append(c)
+    return sorted(lfp_features)
+
+
+def parse_lfp_feature_metadata(feat_name):
+    clean = feat_name.replace("mi_", "")
+    modality = "waveform"
+    band = clean.replace("lfp_", "").replace("cwt_", "")
+
+    if "_envelope" in clean:
+        modality = "envelope"
+        band = clean.replace("lfp_", "").replace("_envelope", "")
+    elif "_phase" in clean:
+        modality = "phase"
+        band = clean.replace("lfp_", "").replace("_phase", "")
+    elif clean.startswith("cwt_"):
+        modality = "cwt"
+        band = clean.replace("cwt_", "")
+    elif clean.startswith("lfp_"):
+        modality = "waveform"
+        band = clean.replace("lfp_", "")
+
+    return band, modality
+
+
+# =============================================================================
+# Training / Transfer Models & Semantic Mapping (Time and Direction assignment corrected)
+# =============================================================================
+
+def infer_cluster_semantic_mapping(df_train, raw_keep_labels):
+    """
+    Semantic mapping rules:
+    1) Position cluster (ID 2, Pink): Max mean (mi_position + mi_position_x_direction).
+    2) Direction cluster (ID 1, Cyan): Max mean (mi_direction) among remaining.
+    3) Time cluster (ID 0, Green): The remaining cluster.
+    """
+    tmp = df_train.copy()
+    tmp["raw_keep_label"] = raw_keep_labels
+    tmp = tmp[tmp["raw_keep_label"] != UNASSIGNED_LABEL].copy()
+
+    if len(tmp) == 0:
+        raise ValueError("No kept cells after thresholding; cannot infer semantic cluster mapping.")
+
+    cluster_ids = sorted(tmp["raw_keep_label"].unique().tolist())
+    cluster_means = {}
+    for cid in cluster_ids:
+        sub = tmp[tmp["raw_keep_label"] == cid]
+        pos_score = sub["mi_position"].mean() + sub["mi_position_x_direction"].mean()
+        dir_score = sub["mi_direction"].mean()
+        time_score = sub["mi_time"].mean() + sub["mi_trial_id"].mean() if "mi_trial_id" in sub.columns else sub[
+            "mi_time"].mean()
+        cluster_means[cid] = {"pos": pos_score, "dir": dir_score, "time": time_score}
+
+    # 1. Position gets ID 2 (Pink)
+    pos_cid = max(cluster_ids, key=lambda c: cluster_means[c]["pos"])
+    remaining = [c for c in cluster_ids if c != pos_cid]
+
+    if len(remaining) >= 2:
+        # Assign Direction (ID 1, Cyan) to the cluster with higher direction score
+        dir_cid = max(remaining, key=lambda c: cluster_means[c]["dir"])
+        time_cid = [c for c in remaining if c != dir_cid][0]
+    elif len(remaining) == 1:
+        dir_cid = remaining[0]
+        time_cid = remaining[0]
+    else:
+        dir_cid = pos_cid
+        time_cid = pos_cid
+
+    # Remap: Time -> 0 (Green), Direction -> 1 (Cyan), Position -> 2 (Pink)
+    remap = {pos_cid: 2, time_cid: 0, dir_cid: 1}
+    remap[UNASSIGNED_LABEL] = UNASSIGNED_LABEL
+    return remap
+
 
 def fit_training_models(df_train):
     X_raw = df_train[MIR_FEATURE_COLUMNS].astype(float).to_numpy()
@@ -638,55 +718,7 @@ def fit_training_models(df_train):
     return df_train, X_raw, X_z, X_scaled, emb_np, model_package
 
 
-def infer_cluster_semantic_mapping(df_train, raw_keep_labels):
-    tmp = df_train.copy()
-    tmp["raw_keep_label"] = raw_keep_labels
-    tmp = tmp[tmp["raw_keep_label"] != UNASSIGNED_LABEL].copy()
-
-    if len(tmp) == 0:
-        raise ValueError("No kept cells after thresholding; cannot infer semantic cluster mapping.")
-
-    z_col_map = {
-        "mi_time": "z_mi_time",
-        "mi_direction": "z_mi_direction",
-        "mi_position": "z_mi_position",
-    }
-
-    cluster_ids = sorted(tmp["raw_keep_label"].unique().tolist())
-    scores = pd.DataFrame(index=cluster_ids, columns=[0, 1, 2], dtype=float)
-
-    for raw_cid in cluster_ids:
-        sub = tmp[tmp["raw_keep_label"] == raw_cid]
-        scores.loc[raw_cid, 0] = sub[z_col_map["mi_time"]].mean()
-        scores.loc[raw_cid, 1] = sub[z_col_map["mi_direction"]].mean()
-        scores.loc[raw_cid, 2] = sub[z_col_map["mi_position"]].mean()
-
-    remap = {}
-    used_raw = set()
-
-    for semantic_label in [0, 1, 2]:
-        col_scores = scores[semantic_label].copy()
-        for raw_cid in used_raw:
-            col_scores.loc[raw_cid] = -np.inf
-        best_raw = int(col_scores.idxmax())
-        remap[best_raw] = semantic_label
-        used_raw.add(best_raw)
-
-    for raw_cid in range(N_CLUSTERS):
-        if raw_cid not in remap:
-            remaining = [x for x in [0, 1, 2] if x not in remap.values()]
-            remap[raw_cid] = remaining[0] if len(remaining) > 0 else raw_cid
-
-    remap[UNASSIGNED_LABEL] = UNASSIGNED_LABEL
-    return remap
-
-
 def apply_trained_model(df_target, model_package, transfer_keep_percentile=TRANSFER_KEEP_PERCENTILE):
-    """Transfer clusters and mark neurons beyond a configurable learning-derived cutoff.
-
-    The percentile refers to the TRAINING cluster's assigned-neuron distance
-    distribution, not the transferred population. All target neurons are kept.
-    """
     if not (0 <= transfer_keep_percentile <= 100):
         raise ValueError("transfer_keep_percentile must be between 0 and 100")
 
@@ -715,7 +747,6 @@ def apply_trained_model(df_target, model_package, transfer_keep_percentile=TRANS
     centroid_distances = np.linalg.norm(
         X_scaled - kmeans.cluster_centers_[raw_pred], axis=1
     )
-    # Thresholds are computed from the learning data for the chosen percentile.
     cutoff_by_cluster = {
         cid: (float(np.percentile(distances, transfer_keep_percentile))
               if len(distances) else np.nan)
@@ -746,7 +777,7 @@ def apply_trained_model(df_target, model_package, transfer_keep_percentile=TRANS
 
 
 # =============================================================================
-# Metadata merge / filtering
+# Metadata Merge / Filtering
 # =============================================================================
 
 def merge_master_metadata(df_mi, df_master):
@@ -766,11 +797,6 @@ def dataset_name_mask(df, substrings):
 
 
 def subset_lt_rot(df, mode):
-    """
-    Uses ONLY session_name:
-      - 'lt' in session_name -> LT
-      - 'rot' in session_name -> ROT
-    """
     if mode == "all":
         return df.copy()
 
@@ -801,7 +827,7 @@ def subset_by_depth_mode(df, depth_mode):
 
 
 # =============================================================================
-# Plotting + stats
+# Plotting + Stats
 # =============================================================================
 
 def plot_embedding_grid(df_plot, out_png_dir, out_svg_dir, out_base, use_z=True, add_depth=False):
@@ -857,7 +883,7 @@ def plot_embedding_grid(df_plot, out_png_dir, out_svg_dir, out_base, use_z=True,
     plt.tight_layout()
     save_figure_both(fig, out_png_dir, out_svg_dir, out_base)
 
-    if add_depth:  # Always passed True for t-SNE plots below
+    if add_depth:
         fig, ax = plt.subplots(figsize=(5, 4.5))
         plot_df = df_plot.copy()
         plot_df["depth_norm"] = plot_df["depth_type"].apply(normalize_depth_label)
@@ -875,6 +901,121 @@ def plot_embedding_grid(df_plot, out_png_dir, out_svg_dir, out_base, use_z=True,
         ax.grid(False)
         plt.tight_layout()
         save_figure_both(fig, out_png_dir, out_svg_dir, out_base + "_by_depth")
+
+
+def plot_cluster_colored_log_contours(df_plot, out_png_dir, out_svg_dir, prefix):
+    plot_df = df_plot[df_plot["cluster_id"] != UNASSIGNED_LABEL].copy()
+    if plot_df.empty:
+        return
+
+    for col in ["mi_position", "mi_time", "mi_cwt_ripple", "mi_cwt_mua", "mi_cwt_slow"]:
+        if col in plot_df.columns:
+            plot_df[col] = np.maximum(plot_df[col], 1e-4)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    pairs = [
+        ("mi_position", "mi_cwt_ripple", "PositionMIR vs CWT Ripple Power"),
+        ("mi_position", "mi_cwt_mua", "PositionMIR vs CWT MUA Power"),
+        ("mi_time", "mi_cwt_slow", "TimeMIR vs CWT Slow Power")
+    ]
+
+    cluster_name_lookup = {0: "Time", 1: "Direction", 2: "Position"}
+
+    for idx, (x_col, y_col, title) in enumerate(pairs):
+        ax = axes[idx]
+        if x_col not in plot_df.columns or y_col not in plot_df.columns:
+            continue
+
+        sns.scatterplot(
+            data=plot_df, x=x_col, y=y_col, hue="cluster_id",
+            palette=CLUSTER_COLOR_MAP, s=35, alpha=0.8, ax=ax, edgecolor="none", legend=(idx == 2)
+        )
+        sns.kdeplot(
+            data=plot_df, x=x_col, y=y_col,
+            levels=5, color="black", linewidths=1.2, ax=ax
+        )
+
+        ax.set_yscale("log")
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel(x_col.replace("mi_", "").capitalize(), fontsize=10)
+        ax.set_ylabel(y_col.replace("mi_", "CWT ").replace("_", " ").capitalize() + " (Log Scale)", fontsize=10)
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+
+        if idx == 2 and ax.get_legend() is not None:
+            handles, labels = ax.get_legend_handles_labels()
+            mapped_labels = [cluster_name_lookup.get(int(float(l)), l) for l in labels]
+            ax.legend(handles=handles, labels=mapped_labels, title="Cluster", fontsize=9, title_fontsize=10)
+
+    plt.tight_layout()
+    save_figure_both(fig, out_png_dir, out_svg_dir, f"{prefix}_cluster_colored_log_contours")
+
+
+def plot_lfp_embedding_suite(df_plot, out_png_dir, out_svg_dir, out_base_prefix):
+    lfp_cols = discover_lfp_columns(df_plot)
+    if not lfp_cols:
+        return
+
+    modalities = {"waveform": [], "envelope": [], "phase": [], "cwt": []}
+    for c in lfp_cols:
+        band, mod = parse_lfp_feature_metadata(c)
+        if mod in modalities:
+            modalities[mod].append((band, c))
+
+    for mod, items in modalities.items():
+        if not items:
+            continue
+
+        scales_to_plot = ["log", "linear"] if mod == "cwt" else ["linear"]
+
+        for scale_type in scales_to_plot:
+            fig, axs = plt.subplots(3, 3, figsize=(12, 10))
+            axs = axs.ravel()
+
+            for idx, (band, col) in enumerate(items):
+                if idx >= len(axs):
+                    break
+                ax = axs[idx]
+                vals = df_plot[col]
+
+                if mod == "cwt" and scale_type == "log":
+                    valid_vals = vals[vals > 0]
+                    vmin = valid_vals.min() if len(valid_vals) > 0 else 1e-4
+                    vmax = valid_vals.max() if len(valid_vals) > 0 else 1.0
+                    norm = LogNorm(vmin=max(vmin, 1e-6), vmax=vmax)
+                    cmap = "viridis"
+                    scale_suffix = "log"
+                elif mod == "phase":
+                    norm = Normalize(vmin=-np.pi, vmax=np.pi)
+                    cmap = "twilight"
+                    scale_suffix = "linear"
+                else:
+                    p2, p98 = np.nanpercentile(vals, 2), np.nanpercentile(vals, 98)
+                    norm = Normalize(vmin=p2, vmax=max(p98, p2 + 1e-3))
+                    cmap = "viridis"
+                    scale_suffix = "linear"
+
+                sc = ax.scatter(
+                    df_plot["tsne_1"],
+                    df_plot["tsne_2"],
+                    c=vals,
+                    cmap=cmap,
+                    norm=norm,
+                    s=SCATTER_SIZE,
+                    alpha=0.85,
+                )
+                ax.set_title(f"tSNE by {band.capitalize()} ({mod}) [{scale_suffix}]", fontsize=10)
+                ax.grid(False)
+                plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.04)
+
+            for j in range(idx + 1, len(axs)):
+                axs[j].axis("off")
+
+            scale_label = f"({scale_type.capitalize()} Scale)" if mod == "cwt" else ""
+            plt.suptitle(f"t-SNE Embeddings Colored by LFP {mod.capitalize()}s {scale_label}", fontsize=12, y=0.98)
+            plt.tight_layout()
+
+            grid_suffix = f"_lfp_{mod}_embedding_grid_{scale_type}" if mod == "cwt" else f"_lfp_{mod}_embedding_grid_standardized"
+            save_figure_both(fig, out_png_dir, out_svg_dir, out_base_prefix + grid_suffix)
 
 
 def plot_cluster_counts(df_plot, out_png_dir, out_svg_dir, stats_dir, out_base):
@@ -1006,53 +1147,85 @@ def plot_cluster_counts_by_depth(df_plot, out_png_dir, out_svg_dir, stats_dir, o
     plot_df = df_plot.copy()
     plot_df["depth_norm"] = plot_df["depth_type"].apply(normalize_depth_label)
 
-    depth_cluster_counts = (
+    mouse_depth_cluster_counts = (
         plot_df
-        .groupby(["depth_norm", "cluster_id"])
+        .groupby(["mouse_name", "depth_norm", "cluster_id"])
         .size()
         .reset_index(name="count")
         .copy()
     )
+    mouse_depth_cluster_counts["cluster_str"] = mouse_depth_cluster_counts["cluster_id"].astype(int).astype(str)
+    mouse_depth_cluster_counts["cluster_name"] = mouse_depth_cluster_counts["cluster_str"].map(CLUSTER_NAME_MAP_STR)
 
-    depth_cluster_counts["cluster_str"] = depth_cluster_counts["cluster_id"].astype(int).astype(str)
-    order = [c for c in ["0", "1", "2", "10"] if c in depth_cluster_counts["cluster_str"].tolist()]
+    order = [c for c in ["0", "1", "2", "10"] if c in mouse_depth_cluster_counts["cluster_str"].unique()]
+    cluster_names = [CLUSTER_NAME_MAP_STR.get(c, c) for c in order]
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
+
+    # Barplot with standard error bars (errorbar="se")
     sns.barplot(
-        data=depth_cluster_counts,
-        x="cluster_str",
+        data=mouse_depth_cluster_counts,
+        x="cluster_name",
         y="count",
         hue="depth_norm",
         palette=DEPTH_COLOR_MAP,
-        order=order,
+        order=cluster_names,
+        errorbar="se",
+        capsize=0.1,
+        err_kws={"linewidth": 1.2},
         ax=ax,
+        alpha=0.85,
     )
 
-    cluster_names = [CLUSTER_NAME_MAP_STR.get(c, c) for c in order]
-    ax.set_xticks(range(len(order)))
+    # Overlay individual animal scatter points in solid black for consistency
+    sns.stripplot(
+        data=mouse_depth_cluster_counts,
+        x="cluster_name",
+        y="count",
+        hue="depth_norm",
+        order=cluster_names,
+        dodge=True,
+        color="black",
+        size=4,
+        alpha=0.5,
+        edgecolor="none",
+        ax=ax,
+        legend=False,
+    )
+
+    ax.set_xticks(range(len(cluster_names)))
     ax.set_xticklabels(cluster_names, rotation=25)
 
-    ax.set_xlabel("Cluster")
-    ax.set_ylabel("Number of Neurons")
-    ax.set_title("Cluster counts by depth")
+    ax.set_xlabel("Cluster", fontsize=11)
+    ax.set_ylabel("Number of Neurons per Mouse", fontsize=11)
+    ax.set_title("Cluster counts by depth", fontsize=12)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) > 2:
+        ax.legend(handles[:2], labels[:2], title="depth_norm", frameon=True)
+
     plt.tight_layout()
     save_figure_both(fig, out_png_dir, out_svg_dir, out_base)
 
     out_csv = os.path.join(os.path.dirname(out_png_dir), out_base + ".csv")
-    depth_cluster_counts.to_csv(out_csv, index=False)
+    mouse_depth_cluster_counts.to_csv(out_csv, index=False)
     print(f"[OK] Saved: {out_csv}")
+
+    # Exclude unassigned cluster (ID 10 / "Unassigned") from the two-way ANOVA & stats
+    stats_df_filtered = mouse_depth_cluster_counts[
+        mouse_depth_cluster_counts["cluster_str"] != str(UNASSIGNED_LABEL)].copy()
 
     txt = ""
     txt += run_two_way_anova_and_pairs(
-        depth_cluster_counts,
+        stats_df_filtered,
         factor_a="cluster_str",
         factor_b="depth_norm",
         value_col="count",
-        title="Cluster counts by depth",
+        title="Cluster counts by depth (excluding unassigned)",
     )
     txt += "\n\n"
     txt += run_chi_square_counts(
-        depth_cluster_counts,
+        stats_df_filtered,
         row_var="depth_norm",
         col_var="cluster_str",
         count_var="count",
@@ -1104,8 +1277,155 @@ def plot_cluster_information_barplot(df_plot, out_png_dir, out_svg_dir, stats_di
     save_text_file(stats_dir, out_base, txt)
 
 
+def plot_lfp_feature_cluster_barplots(df_plot, out_png_dir, out_svg_dir, stats_dir, out_base_prefix):
+    plot_df = df_plot[df_plot["cluster_id"] != UNASSIGNED_LABEL].copy()
+    lfp_cols = discover_lfp_columns(plot_df)
+    if not lfp_cols:
+        return
+
+    stats_txt = []
+    cluster_names_order = ["Time", "Direction", "Position"]
+    palette_colors = [
+        CLUSTER_COLOR_MAP_STR["0"],  # Time (Green)
+        CLUSTER_COLOR_MAP_STR["1"],  # Direction (Cyan)
+        CLUSTER_COLOR_MAP_STR["2"]  # Position (Pink)
+    ]
+
+    for col in lfp_cols:
+        band, mod = parse_lfp_feature_metadata(col)
+        sub_df = plot_df[["cluster_id", col]].dropna().copy()
+        sub_df["cluster_str"] = sub_df["cluster_id"].astype(int).astype(str)
+        sub_df["cluster_name"] = sub_df["cluster_str"].map(CLUSTER_NAME_MAP_STR)
+        sub_df["feature_val"] = sub_df[col]
+
+        fig, ax = plt.subplots(figsize=(4, 3.5))
+        sns.barplot(
+            data=sub_df,
+            x="cluster_name",
+            y="feature_val",
+            order=cluster_names_order,
+            hue="cluster_name",
+            hue_order=cluster_names_order,
+            palette=palette_colors,
+            ax=ax,
+            errorbar="se",
+            alpha=0.85,
+            legend=False,
+        )
+        sns.stripplot(
+            data=sub_df,
+            x="cluster_name",
+            y="feature_val",
+            order=cluster_names_order,
+            color="black",
+            size=3,
+            alpha=0.4,
+            jitter=0.2,
+            ax=ax,
+        )
+
+        ax.set_xlabel("Cluster", fontsize=11)
+        ax.set_ylabel(f"MI ({band} {mod})", fontsize=11)
+        ax.set_title(f"LFP {mod.capitalize()}: {band}", fontsize=11)
+        plt.tight_layout()
+
+        feat_slug = sanitize_for_filename(col)
+        save_figure_both(fig, out_png_dir, out_svg_dir, f"{out_base_prefix}_barplot_{feat_slug}")
+
+        stat_block = run_oneway_ttests(sub_df, group_col="cluster_name", value_col="feature_val",
+                                       title=f"LFP Feature Stats: {col}")
+        stats_txt.append(stat_block + "\n" + "=" * 50 + "\n\n")
+
+    save_text_file(stats_dir, f"{out_base_prefix}_lfp_cluster_stats", "".join(stats_txt))
+
+
+def analyze_behavior_vs_lfp_regression(df_plot, out_png_dir, out_svg_dir, stats_dir, out_base_prefix):
+    plot_df = df_plot[df_plot["cluster_id"] != UNASSIGNED_LABEL].copy()
+    lfp_cols = discover_lfp_columns(plot_df)
+    if not lfp_cols:
+        return
+
+    plot_df["total_behavior_mi"] = plot_df[MIR_FEATURE_COLUMNS].sum(axis=1)
+
+    reg_results = []
+    stats_txt = []
+
+    for lfp_col in lfp_cols:
+        band, mod = parse_lfp_feature_metadata(lfp_col)
+        sub = plot_df[["total_behavior_mi", lfp_col, "cluster_id"]].dropna().copy()
+        if len(sub) < 10:
+            continue
+
+        X = sub[["total_behavior_mi"]].values
+        y = sub[lfp_col].values
+        reg = LinearRegression().fit(X, y)
+        r_val, p_val = pearsonr(sub["total_behavior_mi"], sub[lfp_col])
+
+        reg_results.append({
+            "lfp_feature": lfp_col,
+            "band": band,
+            "modality": mod,
+            "slope": reg.coef_[0],
+            "intercept": reg.intercept_,
+            "r_value": r_val,
+            "p_value": p_val,
+        })
+
+        fig, ax = plt.subplots(figsize=(4.5, 4))
+        sns.scatterplot(
+            data=sub,
+            x="total_behavior_mi",
+            y=lfp_col,
+            hue="cluster_id",
+            palette=CLUSTER_COLOR_MAP,
+            s=25,
+            alpha=0.7,
+            ax=ax,
+        )
+        sns.regplot(
+            data=sub,
+            x="total_behavior_mi",
+            y=lfp_col,
+            scatter=False,
+            color="black",
+            ax=ax,
+        )
+        ax.set_title(f"Behavior vs {band} ({mod})\nr={r_val:.3f}, p={p_val:.2e}", fontsize=10)
+        ax.set_xlabel("Total Behavioral MI", fontsize=11)
+        ax.set_ylabel(f"LFP MI ({band})", fontsize=11)
+        plt.tight_layout()
+
+        feat_slug = sanitize_for_filename(lfp_col)
+        save_figure_both(fig, out_png_dir, out_svg_dir, f"{out_base_prefix}_reg_{feat_slug}")
+
+        stats_txt.append(
+            f"Regression for {lfp_col}:\nSlope={reg.coef_[0]:.5f}, Intercept={reg.intercept_:.5f}, r={r_val:.4f}, p={p_val:.6e}\n\n")
+
+    reg_df = pd.DataFrame(reg_results)
+    reg_csv = os.path.join(os.path.dirname(out_png_dir), f"{out_base_prefix}_regression_coefficients.csv")
+    reg_df.to_csv(reg_csv, index=False)
+    print(f"[OK] Saved: {reg_csv}")
+
+    if len(reg_df) > 0:
+        pivot_slope = reg_df.pivot(index="band", columns="modality", values="slope").fillna(0)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.heatmap(pivot_slope, annot=True, fmt=".3f", cmap="coolwarm", center=0, ax=ax)
+        ax.set_title("Regression Slopes (Behavior vs LFP Features) by Band & Modality", fontsize=11)
+        plt.tight_layout()
+        save_figure_both(fig, out_png_dir, out_svg_dir, f"{out_base_prefix}_regression_slope_heatmap")
+
+        pivot_r = reg_df.pivot(index="band", columns="modality", values="r_value").fillna(0)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.heatmap(pivot_r, annot=True, fmt=".3f", cmap="vlag", center=0, vmin=-1, vmax=1, ax=ax)
+        ax.set_title("Pearson r (Behavior vs LFP Features) by Band & Modality", fontsize=11)
+        plt.tight_layout()
+        save_figure_both(fig, out_png_dir, out_svg_dir, f"{out_base_prefix}_pearson_r_heatmap")
+
+    save_text_file(stats_dir, f"{out_base_prefix}_regression_stats", "".join(stats_txt))
+
+
 # =============================================================================
-# CSV saving
+# CSV Saving
 # =============================================================================
 
 def save_labeled_neuron_csv(df_labeled, out_dir, file_name):
@@ -1221,6 +1541,18 @@ def main():
         use_z=True,
         add_depth=True
     )
+    plot_lfp_embedding_suite(
+        df_train_labeled,
+        TRAIN_PNG_DIR,
+        TRAIN_SVG_DIR,
+        "training"
+    )
+    plot_cluster_colored_log_contours(
+        df_train_labeled,
+        TRAIN_PNG_DIR,
+        TRAIN_SVG_DIR,
+        "training"
+    )
     plot_cluster_counts(
         df_train_labeled,
         TRAIN_PNG_DIR,
@@ -1251,14 +1583,19 @@ def main():
         use_z=False,
         small=False
     )
-    plot_cluster_information_barplot(
+    plot_lfp_feature_cluster_barplots(
         df_train_labeled,
         TRAIN_PNG_DIR,
         TRAIN_SVG_DIR,
         TRAIN_STATS_DIR,
-        "training_cluster_information_barplot_small",
-        use_z=False,
-        small=True
+        "training"
+    )
+    analyze_behavior_vs_lfp_regression(
+        df_train_labeled,
+        TRAIN_PNG_DIR,
+        TRAIN_SVG_DIR,
+        TRAIN_STATS_DIR,
+        "training"
     )
 
     # -------------------------------------------------------------------------
@@ -1323,6 +1660,18 @@ def main():
             use_z=True,
             add_depth=True
         )
+        plot_lfp_embedding_suite(
+            df_applied,
+            subset_png_dir,
+            subset_svg_dir,
+            sanitize_for_filename(name)
+        )
+        plot_cluster_colored_log_contours(
+            df_applied,
+            subset_png_dir,
+            subset_svg_dir,
+            sanitize_for_filename(name)
+        )
         plot_cluster_counts(
             df_applied,
             subset_png_dir,
@@ -1356,14 +1705,19 @@ def main():
             use_z=False,
             small=False
         )
-        plot_cluster_information_barplot(
+        plot_lfp_feature_cluster_barplots(
             df_applied,
             subset_png_dir,
             subset_svg_dir,
             subset_stats_dir,
-            f"{sanitize_for_filename(name)}_cluster_information_barplot_small",
-            use_z=False,
-            small=True
+            sanitize_for_filename(name)
+        )
+        analyze_behavior_vs_lfp_regression(
+            df_applied,
+            subset_png_dir,
+            subset_svg_dir,
+            subset_stats_dir,
+            sanitize_for_filename(name)
         )
 
         subset_meta = {
